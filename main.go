@@ -21,6 +21,7 @@ type Options struct {
 	ServerPort   string
 	ServerHost   string
 	LocationName string
+	Version      bool
 	Debug        bool
 	Open         bool
 }
@@ -34,6 +35,7 @@ type Server struct {
 	Addr       string
 	Directory  string
 	Path       string
+	Query      url.Values
 	TimeHelper *TimeHelper
 }
 
@@ -55,6 +57,9 @@ var (
 	flagSet *flag.FlagSet
 	options Options
 	configs Configs
+
+	// set at go build -ldflags '-X main.Version=xxx'
+	Version = "0.0.0"
 )
 
 const dirTmpl = `
@@ -119,9 +124,8 @@ func newServer(dir string) (*Server, error) {
 	return server, err
 }
 
-func (s *Server) serve() {
-	http.HandleFunc("/", s.handler)
-
+func (s *Server) serve() error {
+	http.HandleFunc("/", s.routeHandler)
 	log.Printf("Serving %s at %s", s.Directory, s.Addr)
 	if options.Open {
 		err := browserOpen("http://" + s.Addr)
@@ -129,25 +133,28 @@ func (s *Server) serve() {
 			os.Stderr.WriteString("failed browser open: " + err.Error())
 		}
 	}
-	http.ListenAndServe(s.Addr, nil)
+	return http.ListenAndServe(s.Addr, nil)
 }
 
-func (s *Server) proxyHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) routeHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.Host+r.RequestURI)
+
+	if r.Method == http.MethodGet {
+		s.handler(w, r)
+	}
 }
 
 func (s *Server) handler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.Host+r.RequestURI)
-
 	w.Header().Set("Cache-Control", "no-store")
 
-	pu, err := url.PathUnescape(r.RequestURI)
+	urlPath, err := url.PathUnescape(r.URL.Path)
+	s.Query = r.URL.Query()
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("failed to path unescape request path %v", err))
 		http.Error(w, fmt.Sprintf("failed to path unescape request path %v", err), http.StatusInternalServerError)
 		return
 	}
-
-	s.Path = path.Join(s.Directory, pu)
+	s.Path = path.Join(s.Directory, urlPath)
 
 	if !isExistPath(s.Path) {
 		os.Stderr.WriteString(fmt.Sprintf("No such file or directory %s", s.Path))
@@ -296,6 +303,7 @@ func setOptions() {
 	flagSet.StringVar(&options.ServerHost, "h", "127.0.0.1", "file server hostname")
 	flagSet.StringVar(&options.ServerPort, "p", "8080", "file server port")
 	flagSet.StringVar(&options.LocationName, "l", "Asia/Tokyo", "time loation")
+	flagSet.BoolVar(&options.Version, "v", false, "show version")
 	flagSet.BoolVar(&options.Debug, "d", false, "log level for debug")
 	flagSet.BoolVar(&options.Open, "o", false, "browser open on file server address")
 }
@@ -313,6 +321,10 @@ func setConfigs() error {
 		OPEN_CMD: os.Getenv("OPEN_CMD"),
 	}
 	return nil
+}
+
+func showVersion() (int, error) {
+	return fmt.Printf("fs version %s", Version)
 }
 
 func isExistDirectory(path string) bool {
@@ -413,6 +425,12 @@ func main() {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 
+	// when version
+	if options.Version {
+		showVersion()
+		os.Exit(0)
+	}
+
 	// set directory
 	var dir string
 	if len(args) > 0 {
@@ -425,10 +443,13 @@ func main() {
 		dir = "."
 	}
 
-	// file serve
+	// server
 	server, err := newServer(dir)
 	if err != nil {
 		log.Fatalf("Failed initialize server %v", err)
 	}
-	server.serve()
+
+	if err = server.serve(); err != nil {
+		log.Fatalf("Failed serve %v", err)
+	}
 }

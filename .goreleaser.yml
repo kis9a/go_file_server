@@ -12,9 +12,7 @@ builds:
     binary: fs
     ldflags:
       - -s -w
-      - -X github.com/kis9a/fs/cmd.Version={{.Version}}
-      - -X github.com/kis9a/fs/cmd.BuildSHA={{.ShortCommit}}
-      - -X github.com/kis9a/fs/cmd.BuildTag={{.Tag}}
+      - -X github.com/kis9a/fs/main.Version={{.Version}}
     env:
       - CGO_ENABLED=0
 
