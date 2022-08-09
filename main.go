@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
@@ -46,12 +47,12 @@ type Server struct {
 }
 
 type File struct {
-	Name          string
-	IsDir         bool
-	ModTime       time.Time
-	ModTimeString string
-	Size          int64
-	SizeString    string
+	Name          string    `json:"name"`
+	IsDir         bool      `json:"isDir"`
+	ModTime       time.Time `json:"modTime"`
+	ModTimeString string    `json:"modTimeString"`
+	Size          int64     `json:"size"`
+	SizeString    string    `json:"SizeString"`
 }
 
 type TimeHelper struct {
@@ -129,14 +130,6 @@ func (s *Server) serve() error {
 func (s *Server) routeHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.Host+r.RequestURI)
 
-	if r.Method == http.MethodGet {
-		s.serveHandler(w, r)
-	}
-}
-
-func (s *Server) serveHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-
 	urlPath, err := url.PathUnescape(r.URL.Path)
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("failed to path unescape request path %v\n", err))
@@ -146,6 +139,95 @@ func (s *Server) serveHandler(w http.ResponseWriter, r *http.Request) {
 	s.Path = path.Join(s.Directory, urlPath)
 	s.Query = r.URL.Query()
 
+	if strings.HasPrefix(s.Path, "__fs") {
+		s.fsHandler(w, r)
+		return
+	}
+
+	if r.Method == http.MethodGet {
+		s.serveHandler(w, r)
+		return
+	}
+}
+
+func (s *Server) fsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if s.Path == "__fs/version" {
+			s.fsVersionHandler(w)
+			return
+		}
+
+		if strings.HasPrefix(s.Path, "__fs/files") {
+			s.fsFilesHandler(w)
+			return
+		}
+	}
+}
+
+func (s *Server) fsVersionHandler(w http.ResponseWriter) {
+	type VersionRes struct {
+		Version string `json:"version"`
+	}
+	j, err := json.Marshal(VersionRes{
+		Version: Version,
+	})
+	if err != nil {
+		os.Stderr.WriteString(fmt.Sprintf("failed json marshal %v\n", err))
+		http.Error(w, fmt.Sprintf("failed json marshal %v", err), http.StatusInternalServerError)
+	}
+	w.Write(j)
+}
+
+func (s *Server) fsFilesHandler(w http.ResponseWriter) {
+	p := strings.TrimPrefix(s.Path, "__fs/files")
+	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		p = "."
+	}
+
+	// check path exsits
+	f, err := os.Open(p)
+	defer f.Close()
+	if err != nil {
+		os.Stderr.WriteString(fmt.Sprintf("failed to open path %v\n", err))
+		http.Error(w, fmt.Sprintf("failed to open path %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	fs, err := f.Stat()
+	if fs.IsDir() {
+		s.Files, err = s.readDirectoryFiles(f)
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("failed read directory files %v\n", err))
+			http.Error(w, fmt.Sprintf("failed read directory files %v", err), http.StatusInternalServerError)
+			return
+		}
+
+		j, err := json.Marshal(s.Files)
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("failed json marshal %v\n", err))
+			http.Error(w, fmt.Sprintf("failed json marshal %v", err), http.StatusInternalServerError)
+		}
+		w.Write(j)
+	} else {
+		j, err := json.Marshal(File{
+			Name:          fs.Name(),
+			IsDir:         fs.IsDir(),
+			Size:          fs.Size(),
+			ModTime:       fs.ModTime(),
+			ModTimeString: s.TimeHelper.ParseTime(fs.ModTime()),
+			SizeString:    FileSize(fs.Size()),
+		})
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("failed json marshal %v\n", err))
+			http.Error(w, fmt.Sprintf("failed json marshal %v", err), http.StatusInternalServerError)
+		}
+		w.Write(j)
+	}
+}
+
+func (s *Server) serveHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if !isExistPath(s.Path) {
 		os.Stderr.WriteString(fmt.Sprintf("No such file or directory %s\n", s.Path))
 		http.Error(w, "file not found", http.StatusNotFound)
