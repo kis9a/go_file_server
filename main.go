@@ -32,9 +32,12 @@ type Options struct {
 }
 
 type Configs struct {
-	HOME           string
-	OPEN_CMD       string
-	FS_TIME_FORMAT string
+	HOME             string
+	OPEN_CMD         string
+	FS_AUTH_PATH     string
+	FS_AUTH_USER     string
+	FS_AUTH_PASSWORD string
+	FS_TIME_FORMAT   string
 }
 
 type Server struct {
@@ -115,6 +118,7 @@ func newServer(dir string) (*Server, error) {
 
 func (s *Server) serve() error {
 	http.HandleFunc("/", s.routeHandler)
+	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {})
 
 	log.Printf("Serving %s at %s", s.Directory, s.Addr)
 
@@ -139,6 +143,21 @@ func (s *Server) routeHandler(w http.ResponseWriter, r *http.Request) {
 	s.Path = path.Join(s.Directory, urlPath)
 	s.Query = r.URL.Query()
 
+	if configs.FS_AUTH_PATH != "" {
+		authPath := configs.FS_AUTH_PATH
+		authPath = strings.TrimSuffix(authPath, "/")
+
+		if strings.HasPrefix(s.Path, authPath) {
+			if !s.checkAuthorization(r) {
+				w.Header().Add("WWW-Authenticate", `Basic realm="Auth path"`)
+				w.WriteHeader(http.StatusUnauthorized)
+				os.Stderr.WriteString(fmt.Sprintf("Authentication failed\n"))
+				http.Error(w, fmt.Sprintf("Authentication failed"), http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+
 	if strings.HasPrefix(s.Path, "__fs") {
 		s.fsHandler(w, r)
 		return
@@ -148,6 +167,11 @@ func (s *Server) routeHandler(w http.ResponseWriter, r *http.Request) {
 		s.serveHandler(w, r)
 		return
 	}
+}
+
+func (s *Server) checkAuthorization(r *http.Request) bool {
+	user, pw, ok := r.BasicAuth()
+	return ok && user == configs.FS_AUTH_USER && pw == configs.FS_AUTH_PASSWORD
 }
 
 func (s *Server) fsHandler(w http.ResponseWriter, r *http.Request) {
@@ -383,9 +407,9 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 		ps = append(ps, p)
 		if p != relPathPwd {
 			if s.Directory == "/" && k == 0 {
-				wb.WriteString(fmt.Sprintf("<span> </span><span><a href=\"/%s%s\">%s</a></span>\n", strings.Join(ps, "/"), queryString, p))
+				wb.WriteString(fmt.Sprintf("<span> </span><span><a href=\"/%s/%s\">%s</a></span>\n", strings.Join(ps, "/"), queryString, p))
 			} else {
-				wb.WriteString(fmt.Sprintf("<span>/</span><span><a href=\"/%s%s\">%s</a></span>\n", strings.Join(ps, "/"), queryString, p))
+				wb.WriteString(fmt.Sprintf("<span>/</span><span><a href=\"/%s/%s\">%s</a></span>\n", strings.Join(ps, "/"), queryString, p))
 			}
 		}
 	}
@@ -608,9 +632,12 @@ func setConfigs() error {
 		}
 	}
 	configs = Configs{
-		HOME:           home,
-		OPEN_CMD:       os.Getenv("OPEN_CMD"),
-		FS_TIME_FORMAT: os.Getenv("FS_TIME_FORMAT"),
+		HOME:             home,
+		OPEN_CMD:         os.Getenv("OPEN_CMD"),
+		FS_AUTH_PATH:     os.Getenv("FS_AUTH_PATH"),
+		FS_AUTH_USER:     os.Getenv("FS_AUTH_USER"),
+		FS_AUTH_PASSWORD: os.Getenv("FS_AUTH_PASSWORD"),
+		FS_TIME_FORMAT:   os.Getenv("FS_TIME_FORMAT"),
 	}
 	return nil
 }
