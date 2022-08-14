@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -14,12 +15,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -171,10 +174,27 @@ func (s *Server) serve() error {
 	}
 
 	httpServer := &http.Server{
-		Addr: s.Addr,
+		Addr:              s.Addr,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	err = httpServer.ListenAndServe()
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
+
+	go func() {
+		if err = httpServer.ListenAndServe(); err != nil {
+			return
+		}
+	}()
+
+	<-stop
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err = httpServer.Shutdown(ctx); err != nil {
+		return fmt.Errorf("Failed gracefully shutdown err: %v", err)
+	}
 	return err
 }
 
