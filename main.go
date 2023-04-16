@@ -45,6 +45,7 @@ type Configs struct {
 	FS_AUTH_PATH     string
 	FS_AUTH_USER     string
 	FS_AUTH_PASSWORD string
+	FS_ADMIN_IP      string
 	FS_TIME_FORMAT   string
 	FS_FILEDB_PATH   string
 }
@@ -109,10 +110,11 @@ const (
 )
 
 var (
-	flagSet *flag.FlagSet
-	mutex   sync.RWMutex
-	options Options
-	configs Configs
+	flagSet  *flag.FlagSet
+	mutex    sync.RWMutex
+	options  Options
+	configs  Configs
+	localIPs []net.IP
 
 	// set at go build -ldflags '-X main.Version=xxx'
 	Version = "0.0.0"
@@ -220,11 +222,14 @@ func (s *Server) routeHandler(w http.ResponseWriter, r *http.Request) {
 		authPath = strings.TrimSuffix(authPath, "/")
 
 		if strings.HasPrefix(s.Path, authPath) {
-			if !s.checkAuthorization(r) {
+			if !s.checkBasicAuthorization(r) {
 				w.Header().Add("WWW-Authenticate", `Basic realm="Auth path"`)
 				w.WriteHeader(http.StatusUnauthorized)
 				os.Stderr.WriteString(fmt.Sprintf("Authentication failed\n"))
-				http.Error(w, fmt.Sprintf("Authentication failed"), http.StatusInternalServerError)
+				http.Error(w,
+					"Authentication failed, Administrators should check the FS_AUTH_PATH, FS_AUTH_USER, and FS_AUTH_PASSWORD env vars",
+					http.StatusInternalServerError,
+				)
 				return
 			}
 		}
@@ -246,7 +251,7 @@ func (s *Server) routeHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) checkAuthorization(r *http.Request) bool {
+func (s *Server) checkBasicAuthorization(r *http.Request) bool {
 	user, pw, ok := r.BasicAuth()
 	return ok && user == configs.FS_AUTH_USER && pw == configs.FS_AUTH_PASSWORD
 }
@@ -277,7 +282,43 @@ func (s *Server) fsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) checkIpAuthorization(r *http.Request) (bool, error) {
+	authed := false
+	remoteIp, err := getHttpRequestIpAddress(r)
+	if err != nil {
+		return authed, err
+	}
+	if configs.FS_ADMIN_IP == "" {
+		localIps, err := getLocalIps()
+		if err != nil {
+			return authed, err
+		}
+		for _, l := range localIps {
+			if remoteIp.Equal(l) {
+				authed = true
+				return authed, err
+			}
+		}
+	} else {
+		adminIp := net.ParseIP(configs.FS_ADMIN_IP)
+		authed = remoteIp.Equal(adminIp)
+	}
+	return authed, err
+}
+
 func (s *Server) fsCdHandler(w http.ResponseWriter, r *http.Request) {
+	authed, err := s.checkIpAuthorization(r)
+	if err != nil {
+		os.Stderr.WriteString(fmt.Sprintf("Failed check ip authorization body %v\n", err))
+		http.Error(w, fmt.Sprintf("Failed check ip authorization %v\n", err), http.StatusInternalServerError)
+		return
+	}
+	if !authed {
+		os.Stderr.WriteString("Not an allowed IP")
+		http.Error(w, "Not an allowed IP", http.StatusUnauthorized)
+		return
+	}
+
 	type Body struct {
 		Path string `json:"path"`
 	}
@@ -1015,6 +1056,7 @@ func setConfigs() error {
 	configs = Configs{
 		HOME:             home,
 		OPEN_CMD:         os.Getenv("OPEN_CMD"),
+		FS_ADMIN_IP:      os.Getenv("FS_ADMIN_IP"),
 		FS_AUTH_PATH:     os.Getenv("FS_AUTH_PATH"),
 		FS_AUTH_USER:     os.Getenv("FS_AUTH_USER"),
 		FS_AUTH_PASSWORD: os.Getenv("FS_AUTH_PASSWORD"),
@@ -1103,6 +1145,42 @@ func browserOpen(url string) error {
 		}
 	}
 	return nil
+}
+
+func getHttpRequestIpAddress(r *http.Request) (net.IP, error) {
+	var err error
+	remoteAddr := strings.TrimSpace(r.Header.Get("X-Real-IP"))
+	if remoteAddr == "" {
+		remoteAddr, _, err = net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	}
+	return net.ParseIP(remoteAddr), err
+}
+
+func getLocalIps() ([]net.IP, error) {
+	var ips []net.IP
+	var err error
+	if len(localIPs) > 0 {
+		return localIPs, err
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ips, err
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return ips, err
+		}
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ips = append(ips, v.IP)
+			case *net.IPAddr:
+				ips = append(ips, v.IP)
+			}
+		}
+	}
+	return ips, err
 }
 
 // endpoints
