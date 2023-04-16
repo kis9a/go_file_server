@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -108,6 +110,7 @@ const (
 
 var (
 	flagSet *flag.FlagSet
+	mutex   sync.RWMutex
 	options Options
 	configs Configs
 
@@ -823,8 +826,10 @@ func (f *Frecency) read() error {
 	}
 
 	cr := csv.NewReader(bytes.NewReader(r))
+	mutex.RLock()
 	cr.Comma = f.Comma
 	csvs, err := cr.ReadAll()
+	mutex.RUnlock()
 	if err != nil {
 		return fmt.Errorf("Counld not read csv: %s, err %v", configs.FS_FILEDB_PATH, err)
 	}
@@ -853,18 +858,41 @@ func (f *Frecency) read() error {
 	return err
 }
 
+func (f *Frecency) backoff(retries int) time.Duration {
+	maxDelay := 200 * time.Millisecond
+	delay := time.Duration(1<<uint(retries))*time.Millisecond + time.Duration(rand.Int63n(int64(time.Millisecond)))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	time.Sleep(delay)
+	return delay
+}
+
 func (f *Frecency) save() error {
 	var csvs [][]string
 	for _, v := range f.FrecencyFileItems {
 		csvs = append(csvs, []string{v.Path, fmt.Sprintf("%d", v.Rank), fmt.Sprintf("%d", v.TimeStamp)})
 	}
+	mutex.RLock()
 	fs, err := os.Create(configs.FS_FILEDB_PATH)
+	mutex.RUnlock()
 	if err != nil {
 		return fmt.Errorf("Counld not create file path: %s, err %v", configs.FS_FILEDB_PATH, err)
 	}
-	w := csv.NewWriter(fs)
-	w.Comma = f.Comma
-	return w.WriteAll(csvs)
+
+	retries := 5
+	for i := 0; i < retries; i++ {
+		w := csv.NewWriter(fs)
+		mutex.Lock()
+		w.Comma = f.Comma
+		err = w.WriteAll(csvs)
+		mutex.Unlock()
+		if err == nil {
+			return nil
+		}
+		f.backoff(i)
+	}
+	return fmt.Errorf("Counld not write file path: %s, err %v", configs.FS_FILEDB_PATH, err)
 }
 
 func (f *Frecency) add(path string) error {
