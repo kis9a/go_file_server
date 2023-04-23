@@ -28,37 +28,41 @@ import (
 	"time"
 )
 
-type Options struct {
-	ServerPort   string
-	ServerHost   string
-	LocationName string
-	Cd           bool
-	Simple       bool
-	Version      bool
-	Debug        bool
-	Open         bool
+type Config struct {
+	HOME                   string
+	OPEN_CMD               string
+	FS_AUTH_PATH           string
+	FS_AUTH_USER           string
+	FS_AUTH_PASSWORD       string
+	FS_ADMIN_IP            string
+	FS_TIME_FORMAT         string
+	FS_FRECENCY_FILE_PATH  string
+	FS_RATE_LIMIT_COUNT    int
+	FS_RATE_LIMIT_INTERVAL int
 }
 
-type Configs struct {
-	HOME             string
-	OPEN_CMD         string
-	FS_AUTH_PATH     string
-	FS_AUTH_USER     string
-	FS_AUTH_PASSWORD string
-	FS_ADMIN_IP      string
-	FS_TIME_FORMAT   string
-	FS_FILEDB_PATH   string
+type Options struct {
+	serverPort   string
+	serverHost   string
+	locationName string
+	cd           bool
+	simple       bool
+	version      bool
+	debug        bool
+	open         bool
 }
 
 type Server struct {
-	Addr       string
-	Directory  string
-	Path       string
-	UrlPath    string
-	Query      url.Values
-	Files      []File
-	Frecency   *Frecency
-	TimeHelper *TimeHelper
+	address     string
+	directory   string
+	path        string
+	urlPath     string
+	query       url.Values
+	files       []File
+	config      *Config
+	frecency    *Frecency
+	rateLimiter *RateLimiter
+	timeHelper  *TimeHelper
 }
 
 type File struct {
@@ -70,20 +74,33 @@ type File struct {
 	SizeString    string    `json:"SizeString"`
 }
 
+type RateLimiter struct {
+	sync.RWMutex
+	limitCount int
+	interval   int
+	ctx        context.Context
+	once       sync.Once
+	done       chan struct{}
+	entry      map[string]int
+}
+
 type TimeHelper struct {
-	Location *time.Location
-	Now      time.Time
+	location   *time.Location
+	now        time.Time
+	timeFormat string
 }
 
 type Frecency struct {
-	Frecs             []Frec
-	FrecencyFileItems []FrecencyFileItem
-	Comma             rune
+	sync.RWMutex
+	frecs             []Frec
+	frecencyFileItems []FrecencyFileItem
+	filePath          string
+	comma             rune
 }
 
 type Frec struct {
-	Score int
-	Path  string
+	score int
+	path  string
 }
 
 type FrecencyFileItem struct {
@@ -111,76 +128,81 @@ const (
 
 var (
 	flagSet  *flag.FlagSet
-	mutex    sync.RWMutex
 	options  Options
-	configs  Configs
-	localIPs []net.IP
+	localIps []net.IP
 
-	// set at go build -ldflags '-X main.Version=xxx'
-	Version = "0.0.0"
+	// set at go build -ldflags '-X main.version=xxx'
+	version = "0.0.0"
 )
 
 // server
-func newServer(dir string) (*Server, error) {
+func newServer(dir string, config *Config) (*Server, error) {
 	// set server dir
 	server := &Server{
-		Directory: dir,
+		directory: dir,
+		config:    config,
 	}
 
 	// check tcp addr
-	addr := net.JoinHostPort(options.ServerHost, options.ServerPort)
+	addr := net.JoinHostPort(options.serverHost, options.serverPort)
 	_, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return server, fmt.Errorf("Listen addr could not resolve: %s", addr)
 	} else {
-		server.Addr = addr
+		server.address = addr
 	}
 
 	// iniitalize timeh
-	timeh, err := newTimeHelper(options.LocationName)
+	timeh, err := newTimeHelper(options.locationName, config.FS_TIME_FORMAT)
 	if err != nil {
 		return server, fmt.Errorf("Failed initialize time helper: %v", err)
 	} else {
-		server.TimeHelper = timeh
+		server.timeHelper = timeh
 	}
+
+	// initialize rateLimiter
+	server.rateLimiter = newRateLimiter(config.FS_RATE_LIMIT_COUNT, config.FS_RATE_LIMIT_INTERVAL)
 
 	// initialize frecency
-	if !isExistPath(configs.FS_FILEDB_PATH) {
-		_, err := os.Create(configs.FS_FILEDB_PATH)
+	if !isExistPath(config.FS_FRECENCY_FILE_PATH) {
+		_, err := os.Create(config.FS_FRECENCY_FILE_PATH)
 		if err != nil {
-			return server, fmt.Errorf("Failed initialize FrecencyFileDB path: %s, err: %v", configs.FS_FILEDB_PATH, err)
+			return server, fmt.Errorf("Failed initialize FrecencyFileDB path: %s, err: %v", config.FS_FRECENCY_FILE_PATH, err)
 		}
 	}
-	server.Frecency, err = newFrecency(configs.FS_FILEDB_PATH)
-
-	if err := server.Frecency.add(server.Directory); err != nil {
-		return server, fmt.Errorf("Failed frecency add path: %s, err: %v", server.Directory, err)
+	server.frecency = newFrecency(config.FS_FRECENCY_FILE_PATH)
+	if err := server.frecency.add(server.directory); err != nil {
+		return server, fmt.Errorf("Failed frecency add path: %s, err: %v", server.directory, err)
 	}
-
-	if err := server.Frecency.clean(); err != nil {
+	if err := server.frecency.clean(); err != nil {
 		return server, fmt.Errorf("Failed frecency clean err: %v", err)
 	}
-
 	return server, err
 }
 
 func (s *Server) serve() error {
 	var err error
-	http.HandleFunc("/", s.routeHandler)
-	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {})
+	mux := s.routeHandler()
+	log.Printf("Serving %s at %s", s.directory, s.address)
 
-	log.Printf("Serving %s at %s", s.Directory, s.Addr)
-
-	if options.Open {
-		err := browserOpen("http://" + s.Addr)
+	if options.open {
+		err := s.browserOpen("http://" + s.address)
 		if err != nil {
 			os.Stderr.WriteString("Failed browser open: " + err.Error())
 		}
 	}
 
+	// context rate limit worker
+	ctxRateLimiter, cancelRateLimiter := context.WithCancel(context.Background())
+	s.rateLimiter.ctx = ctxRateLimiter
+	s.rateLimiter.runClearRateLimitWorker()
+	defer cancelRateLimiter()
+
+	// server with graceful shutdown
 	httpServer := &http.Server{
-		Addr:              s.Addr,
-		ReadHeaderTimeout: 10 * time.Second,
+		Addr:              s.address,
+		ReadHeaderTimeout: 15 * time.Second,
+		Handler:           mux,
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -188,137 +210,165 @@ func (s *Server) serve() error {
 
 	go func() {
 		if err = httpServer.ListenAndServe(); err != nil {
-			return
+			if err != http.ErrServerClosed {
+				os.Stderr.WriteString("Failed on Listen And Server, error: " + err.Error())
+			}
 		}
 	}()
 
 	<-stop
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer serverCancel()
 
-	if err = httpServer.Shutdown(ctx); err != nil {
+	if err = httpServer.Shutdown(serverCtx); err != nil {
 		return fmt.Errorf("Failed gracefully shutdown err: %v", err)
 	}
+
 	return err
 }
 
-func (s *Server) routeHandler(w http.ResponseWriter, r *http.Request) {
-	var err error
-	log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.Host+r.RequestURI)
+func (s *Server) routeHandler() *http.ServeMux {
+	mux := http.NewServeMux()
 
-	s.UrlPath, err = url.PathUnescape(r.URL.Path)
-	if err != nil {
-		os.Stderr.WriteString(fmt.Sprintf("Failed to path unescape request path %v\n", err))
-		http.Error(w, fmt.Sprintf("Failed to path unescape request path %v", err), http.StatusInternalServerError)
-		return
-	}
-	pathBefore := s.Path
-	s.Path = path.Join(s.Directory, s.UrlPath)
-	s.Query = r.URL.Query()
+	// __fs
+	fs := http.NewServeMux()
+	fs.HandleFunc("/version", s.handleVersion)
+	fs.HandleFunc("/frecs", s.handleFrecs)
+	fs.HandleFunc("/files", s.handleFiles)
+	fs.Handle("/cd", s.middlewareIpAuthorizer(http.HandlerFunc(s.handleCd)))
 
-	if configs.FS_AUTH_PATH != "" {
-		authPath := configs.FS_AUTH_PATH
-		authPath = strings.TrimSuffix(authPath, "/")
+	// handle fs
+	mux.Handle("/__fs/", http.StripPrefix("/__fs", s.commonMiddlewares(fs)))
 
-		if strings.HasPrefix(s.Path, authPath) {
-			if !s.checkBasicAuthorization(r) {
-				w.Header().Add("WWW-Authenticate", `Basic realm="Auth path"`)
-				w.WriteHeader(http.StatusUnauthorized)
-				os.Stderr.WriteString(fmt.Sprintf("Authentication failed\n"))
-				http.Error(w,
-					"Authentication failed, Administrators should check the FS_AUTH_PATH, FS_AUTH_USER, and FS_AUTH_PASSWORD env vars",
-					http.StatusInternalServerError,
-				)
+	// handle favicon.ico
+	mux.Handle("/favicon.ico", s.commonMiddlewares(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {},
+	)))
+
+	// ssr
+	ssr := http.NewServeMux()
+	ssr.HandleFunc("/", s.handleServer)
+
+	// handle ssr
+	mux.Handle("/", s.commonMiddlewares(s.middlewareFrecency(ssr)))
+	return mux
+}
+
+func (s *Server) commonMiddlewares(h http.Handler) http.Handler {
+	return s.middlewareUrlParser(
+		s.middlewareAccessLogger(
+			s.middlewareRateLimiter(
+				s.middlewareBasicAuthenticator(h),
+			),
+		),
+	)
+}
+
+func (s *Server) middlewareUrlParser(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		s.urlPath, err = url.PathUnescape(r.URL.Path)
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Failed to path unescape request path %v\n", err))
+			http.Error(w, fmt.Sprintf("Failed to path unescape request path %v", err), http.StatusInternalServerError)
+			return
+		}
+		s.path = path.Join(s.directory, s.urlPath)
+		s.query = r.URL.Query()
+		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), "pathBefore", s.path)))
+	})
+}
+
+func (s *Server) middlewareAccessLogger(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.Host+r.RequestURI)
+		h.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) middlewareRateLimiter(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip, err := getHttpRequestIpAddress(r)
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Failed get remote IP: %v\n", err))
+		}
+		if s.rateLimiter.isRateLimited(ip.String()) {
+			os.Stderr.WriteString(fmt.Sprintf("Rate limited, ip: %s\n", ip))
+			http.Error(w, fmt.Sprintf("Rate Lmited, ip: %s\n", ip), http.StatusTooManyRequests)
+			return
+		} else {
+			s.rateLimiter.increment(ip.String())
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) middlewareBasicAuthenticator(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.config.FS_AUTH_PATH != "" {
+			authPath := s.config.FS_AUTH_PATH
+			authPath = strings.TrimSuffix(authPath, "/")
+
+			if strings.HasPrefix(s.path, authPath) {
+				if !s.isBasicAuthorized(r) {
+					w.Header().Add("WWW-Authenticate", `Basic realm="Auth path"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					os.Stderr.WriteString(fmt.Sprintf("Authentication failed\n"))
+					http.Error(w,
+						"Authentication failed, Administrators should check the FS_AUTH_PATH, FS_AUTH_USER, and FS_AUTH_PASSWORD env vars",
+						http.StatusInternalServerError,
+					)
+					return
+				}
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) middlewareIpAuthorizer(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authed, err := s.isIpAuthorized(r)
+		if err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Failed check ip authorization body %v\n", err))
+			http.Error(w, fmt.Sprintf("Failed check ip authorization %v\n", err), http.StatusInternalServerError)
+			return
+		}
+		if !authed {
+			ip, err := getHttpRequestIpAddress(r)
+			if err != nil {
+				os.Stderr.WriteString(fmt.Sprintf("Failed get remote IP: %v\n", err))
+			}
+			os.Stderr.WriteString(fmt.Sprintf("Not an allowed IP: %s\n", ip.String()))
+			http.Error(w, "Not an allowed IP", http.StatusUnauthorized)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) middlewareFrecency(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathBefore := r.Context().Value("pathBefore")
+		if pathBefore == nil {
+			os.Stderr.WriteString(fmt.Sprintf("No value in context %v\n", "pathBefore"))
+		} else {
+			if r.Method == http.MethodGet {
+				if pathBefore != s.path && isExistDirectory(s.path) {
+					if err := s.frecency.add(s.path); err != nil {
+						os.Stderr.WriteString(fmt.Sprintf("Failed frecency add path: %s, err: %v", s.path, err))
+					}
+				}
+				s.handleServer(w, r)
 				return
 			}
 		}
-	}
-
-	if strings.HasPrefix(s.UrlPath, "/__fs") {
-		s.fsHandler(w, r)
-		return
-	}
-
-	if r.Method == http.MethodGet {
-		if pathBefore != s.Path && isExistDirectory(s.Path) {
-			if err := s.Frecency.add(s.Path); err != nil {
-				os.Stderr.WriteString(fmt.Sprintf("Failed frecency add path: %s, err: %v", s.Path, err))
-			}
-		}
-		s.serveHandler(w, r)
-		return
-	}
+		h.ServeHTTP(w, r)
+	})
 }
 
-func (s *Server) checkBasicAuthorization(r *http.Request) bool {
-	user, pw, ok := r.BasicAuth()
-	return ok && user == configs.FS_AUTH_USER && pw == configs.FS_AUTH_PASSWORD
-}
-
-func (s *Server) fsHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodGet {
-		if s.UrlPath == "/__fs/version" {
-			s.fsVersionHandler(w)
-			return
-		}
-
-		if strings.HasPrefix(s.UrlPath, "/__fs/files") {
-			s.fsFilesHandler(w)
-			return
-		}
-
-		if strings.HasPrefix(s.UrlPath, "/__fs/frecs") {
-			s.fsFrecsHandler(w)
-			return
-		}
-	}
-
-	if r.Method == http.MethodPost {
-		if options.Cd && strings.HasPrefix(s.UrlPath, "/__fs/cd") {
-			s.fsCdHandler(w, r)
-			return
-		}
-	}
-}
-
-func (s *Server) checkIpAuthorization(r *http.Request) (bool, error) {
-	authed := false
-	remoteIp, err := getHttpRequestIpAddress(r)
-	if err != nil {
-		return authed, err
-	}
-	if configs.FS_ADMIN_IP == "" {
-		localIps, err := getLocalIps()
-		if err != nil {
-			return authed, err
-		}
-		for _, l := range localIps {
-			if remoteIp.Equal(l) {
-				authed = true
-				return authed, err
-			}
-		}
-	} else {
-		adminIp := net.ParseIP(configs.FS_ADMIN_IP)
-		authed = remoteIp.Equal(adminIp)
-	}
-	return authed, err
-}
-
-func (s *Server) fsCdHandler(w http.ResponseWriter, r *http.Request) {
-	authed, err := s.checkIpAuthorization(r)
-	if err != nil {
-		os.Stderr.WriteString(fmt.Sprintf("Failed check ip authorization body %v\n", err))
-		http.Error(w, fmt.Sprintf("Failed check ip authorization %v\n", err), http.StatusInternalServerError)
-		return
-	}
-	if !authed {
-		os.Stderr.WriteString("Not an allowed IP")
-		http.Error(w, "Not an allowed IP", http.StatusUnauthorized)
-		return
-	}
-
+func (s *Server) handleCd(w http.ResponseWriter, r *http.Request) {
 	type Body struct {
 		Path string `json:"path"`
 	}
@@ -330,37 +380,37 @@ func (s *Server) fsCdHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if filepath.IsAbs(body.Path) {
-		s.Directory = body.Path
+		s.directory = body.Path
 	} else {
-		dir, err := filepath.Abs(filepath.Join(s.Directory, body.Path))
+		dir, err := filepath.Abs(filepath.Join(s.directory, body.Path))
 		if err != nil {
 			os.Stderr.WriteString(fmt.Sprintf("Failed make absolute path %v\n", err))
 			http.Error(w, fmt.Sprintf("Failed make absolute path %v", err), http.StatusInternalServerError)
 			return
 		} else {
-			s.Directory = dir
+			s.directory = dir
 		}
 	}
 
-	if !isExistDirectory(s.Directory) {
+	if !isExistDirectory(s.directory) {
+		os.Stderr.WriteString(fmt.Sprintf("No such directory %s", s.directory))
 		http.Error(w, fmt.Sprintf("No such directory"), http.StatusBadRequest)
-		log.Fatalf("No such directory")
 		return
 	}
 
-	if err := s.Frecency.add(s.Directory); err != nil {
+	if err := s.frecency.add(s.directory); err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed frecency add %v", err))
 		http.Error(w, fmt.Sprintf("Failed frecency add %v", err), http.StatusInternalServerError)
 		return
 	}
 }
 
-func (s *Server) fsVersionHandler(w http.ResponseWriter) {
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	type VersionRes struct {
 		Version string `json:"version"`
 	}
 	j, err := json.Marshal(VersionRes{
-		Version: Version,
+		Version: version,
 	})
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed json marshal %v\n", err))
@@ -369,13 +419,13 @@ func (s *Server) fsVersionHandler(w http.ResponseWriter) {
 	w.Write(j)
 }
 
-func (s *Server) fsFrecsHandler(w http.ResponseWriter) {
-	if err := s.Frecency.read(); err != nil {
+func (s *Server) handleFrecs(w http.ResponseWriter, r *http.Request) {
+	if err := s.frecency.read(); err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed read fracs err: %v\n", err))
 		http.Error(w, fmt.Sprintf("Failed read fracs err: %v\n", err), http.StatusInternalServerError)
 	}
 
-	j, err := json.Marshal(s.Frecency.getFrecs(30))
+	j, err := json.Marshal(s.frecency.getFrecs(30))
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed json marshal %v\n", err))
 		http.Error(w, fmt.Sprintf("Failed json marshal %v", err), http.StatusInternalServerError)
@@ -383,29 +433,29 @@ func (s *Server) fsFrecsHandler(w http.ResponseWriter) {
 	w.Write(j)
 }
 
-func (s *Server) fsFilesHandler(w http.ResponseWriter) {
-	p := strings.TrimPrefix(s.UrlPath, "/__fs/files")
-	p = filepath.Join(s.Directory, p)
+func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
+	p := strings.TrimPrefix(s.urlPath, "/__fs/files")
+	p = filepath.Join(s.directory, p)
 
 	// check path exsits
 	f, err := os.Open(p)
 	defer f.Close()
 	if err != nil {
-		os.Stderr.WriteString(fmt.Sprintf("Failed to open path %v\n", err))
-		http.Error(w, fmt.Sprintf("Failed to open path %v", err), http.StatusInternalServerError)
+		os.Stderr.WriteString(fmt.Sprintf("Failed to open path, err: %v\n", err))
+		http.Error(w, fmt.Sprintf("Failed to open path, err: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	fs, err := f.Stat()
 	if fs.IsDir() {
-		s.Files, err = s.readDirectoryFiles(f)
+		s.files, err = s.readDirectoryFiles(f)
 		if err != nil {
 			os.Stderr.WriteString(fmt.Sprintf("Failed read directory files %v\n", err))
 			http.Error(w, fmt.Sprintf("Failed read directory files %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		j, err := json.Marshal(s.Files)
+		j, err := json.Marshal(s.files)
 		if err != nil {
 			os.Stderr.WriteString(fmt.Sprintf("Failed json marshal %v\n", err))
 			http.Error(w, fmt.Sprintf("Failed json marshal %v", err), http.StatusInternalServerError)
@@ -417,8 +467,8 @@ func (s *Server) fsFilesHandler(w http.ResponseWriter) {
 			IsDir:         fs.IsDir(),
 			Size:          fs.Size(),
 			ModTime:       fs.ModTime(),
-			ModTimeString: s.TimeHelper.ParseTime(fs.ModTime()),
-			SizeString:    FileSize(fs.Size()),
+			ModTimeString: s.timeHelper.parseTime(fs.ModTime()),
+			SizeString:    fileSize(fs.Size()),
 		})
 		if err != nil {
 			os.Stderr.WriteString(fmt.Sprintf("Failed json marshal %v\n", err))
@@ -428,16 +478,16 @@ func (s *Server) fsFilesHandler(w http.ResponseWriter) {
 	}
 }
 
-func (s *Server) serveHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 
-	if !isExistPath(s.Path) {
-		os.Stderr.WriteString(fmt.Sprintf("No such file or directory %s\n", s.Path))
+	if !isExistPath(s.path) {
+		os.Stderr.WriteString(fmt.Sprintf("No such file or directory %s\n", s.path))
 		http.Error(w, "file not found", http.StatusNotFound)
 		return
 	}
 
-	f, err := os.Open(s.Path)
+	f, err := os.Open(s.path)
 	defer f.Close()
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed to open path %v\n", err))
@@ -445,25 +495,25 @@ func (s *Server) serveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if isExistDirectory(s.Path) {
-		s.Files, err = s.readDirectoryFiles(f)
+	if isExistDirectory(s.path) {
+		s.files, err = s.readDirectoryFiles(f)
 		if err != nil {
 			os.Stderr.WriteString(fmt.Sprintf("Failed read directory files %v\n", err))
 			http.Error(w, fmt.Sprintf("Failed read directory files %v", err), http.StatusInternalServerError)
 			return
 		}
 
-		sortKey := s.getSortKey(s.Query.Get("sortKey"))
-		sortMethod := s.getSortMethod(s.Query.Get("sortMethod"))
+		sortKey := s.getSortKey(s.query.Get("sortKey"))
+		sortMethod := s.getSortMethod(s.query.Get("sortMethod"))
 
 		if sortKey != SORT_KEY_UNKNOWN && sortMethod != SORT_METHOD_UNKNOWN {
 			switch sortKey {
 			case SORT_KEY_NAME:
-				s.filesSortByName(sortMethod)
+				s.sortByFileName(sortMethod)
 			case SORT_KEY_SIZE:
-				s.filesSortBySize(sortMethod)
+				s.sortByFileSize(sortMethod)
 			case SORT_KEY_TIME:
-				s.filesSortByTime(sortMethod)
+				s.sortByFileTime(sortMethod)
 			}
 		}
 
@@ -617,7 +667,7 @@ func (s *Server) adaptLayout(w http.ResponseWriter, body string) (string, error)
 
 	var b bytes.Buffer
 	tmpl.Execute(&b, Template{
-		Path: s.Path,
+		Path: s.path,
 		Body: template.HTML(body),
 	})
 
@@ -625,7 +675,7 @@ func (s *Server) adaptLayout(w http.ResponseWriter, body string) (string, error)
 }
 
 func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
-	html, err := os.Open(path.Join(s.Path, "index.html"))
+	html, err := os.Open(path.Join(s.path, "index.html"))
 
 	if err == nil {
 		io.Copy(w, html)
@@ -635,14 +685,14 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	}
 	html.Close()
 
-	absDir, err := filepath.Abs(s.Directory)
+	absDir, err := filepath.Abs(s.directory)
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed make absolute path %v\n", err))
 		http.Error(w, fmt.Sprintf("Failed make absolute path %v", err), http.StatusInternalServerError)
 		return err
 	}
 
-	absPath, err := filepath.Abs(s.Path)
+	absPath, err := filepath.Abs(s.path)
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Could not get directory absolute path %v\n", err))
 		http.Error(w, fmt.Sprintf("Could not get directory absolute path %v", err), http.StatusInternalServerError)
@@ -657,11 +707,11 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	}
 
 	absDirName := absDir
-	if strings.HasPrefix(absDir, configs.HOME) {
-		absDirName = strings.ReplaceAll(absDir, configs.HOME, "~")
+	if strings.HasPrefix(absDir, s.config.HOME) {
+		absDirName = strings.ReplaceAll(absDir, s.config.HOME, "~")
 	}
 
-	queryString := s.Query.Encode()
+	queryString := s.query.Encode()
 	if queryString != "" {
 		queryString = "?" + queryString
 	}
@@ -676,7 +726,7 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	for k, p := range splitedPaths {
 		ps = append(ps, p)
 		if p != relPathPwd {
-			if s.Directory == "/" && k == 0 {
+			if s.directory == "/" && k == 0 {
 				wb.WriteString(fmt.Sprintf("<span> </span><span><a href=\"/%s/%s\">%s</a></span>\n", strings.Join(ps, "/"), queryString, p))
 			} else {
 				wb.WriteString(fmt.Sprintf("<span>/</span><span><a href=\"/%s/%s\">%s</a></span>\n", strings.Join(ps, "/"), queryString, p))
@@ -685,13 +735,13 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	}
 
 	wb.WriteString("</div>\n<ul>\n")
-	if options.Simple {
+	if options.simple {
 		wb.WriteString("<li class=\"colh\"><div><span onclick=\"s('name')\">FILES</span></div></li>\n")
 	} else {
 		wb.WriteString("<li class=\"colh\"><div><span onclick=\"s('name')\">FILES</span></div>\n<div><span onclick=\"s('size')\">SIZE</span></div>\n<div><span onclick=\"s('time')\">TIME</span></div></li>\n")
 	}
 
-	if s.Directory != "/" && s.UrlPath == "/" && options.Cd {
+	if s.directory != "/" && s.urlPath == "/" && options.cd {
 		wb.WriteString(fmt.Sprintf("<li><span class=\"up\" onclick=\"cd('..')\">%s/</span></li>\n", ".."))
 	}
 
@@ -700,17 +750,17 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 		wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s/</a></span></li>\n", fiPath, queryString, fi.Name))
 	}
 
-	for _, fi := range s.Files {
+	for _, fi := range s.files {
 		fiPath := filepath.Join(url.PathEscape(fi.Name))
 
 		if fi.IsDir {
-			if options.Simple {
+			if options.simple {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s/</a></span></li>\n", fiPath, queryString, fi.Name))
 			} else {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s/</a></span><span class=\"size\">%s</span><span class=\"modTime\">%s</span></li>\n", fiPath, queryString, fi.Name, fi.SizeString, fi.ModTimeString))
 			}
 		} else {
-			if options.Simple {
+			if options.simple {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s</a></span></li>\n", fiPath, queryString, fi.Name))
 			} else {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s</a></span><span class=\"size\">%s</span><span class=\"modTime\">%s</span></li>\n", fiPath, queryString, fi.Name, fi.SizeString, fi.ModTimeString))
@@ -719,12 +769,12 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	}
 	wb.WriteString("</ul>\n")
 
-	if options.Cd {
+	if options.cd {
 		wb.WriteString("<ul>\n")
 		wb.WriteString("<li class=\"frecs colh\"><div><span onclick=\"frecs()\">FRECS</span></div></li>\n")
-		for _, fi := range s.Frecency.getFrecs(30) {
-			fiPath := strings.ReplaceAll(fi.Path, configs.HOME, "~")
-			wb.WriteString(fmt.Sprintf("<li><span class=\"frec\" score=\"%d\" onclick=\"cd('%s')\">%s/</span></li>\n", fi.Score, fi.Path, fiPath))
+		for _, fi := range s.frecency.getFrecs(30) {
+			fiPath := strings.ReplaceAll(fi.path, s.config.HOME, "~")
+			wb.WriteString(fmt.Sprintf("<li><span class=\"frec\" score=\"%d\" onclick=\"cd('%s')\">%s/</span></li>\n", fi.score, fi.path, fiPath))
 		}
 		wb.WriteString("</ul>\n")
 	}
@@ -740,7 +790,7 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 }
 
 func (s *Server) renderFile(f *os.File, w http.ResponseWriter, r *http.Request) error {
-	http.ServeContent(w, r, s.Path, time.Time{}, f)
+	http.ServeContent(w, r, s.path, time.Time{}, f)
 	return nil
 }
 
@@ -766,53 +816,53 @@ func (s *Server) getSortMethod(method string) SortMethod {
 	return SORT_METHOD_UNKNOWN
 }
 
-func (s *Server) filesSortByName(method SortMethod) {
+func (s *Server) sortByFileName(method SortMethod) {
 	switch method {
 	case SORT_ASCENDING:
-		sort.Slice(s.Files, func(i, j int) bool {
-			return s.Files[i].Name < s.Files[j].Name
+		sort.Slice(s.files, func(i, j int) bool {
+			return s.files[i].Name < s.files[j].Name
 		})
 		return
 	case SORT_DESCENDING:
-		sort.Slice(s.Files, func(i, j int) bool {
-			return s.Files[i].Name > s.Files[j].Name
+		sort.Slice(s.files, func(i, j int) bool {
+			return s.files[i].Name > s.files[j].Name
 		})
 		return
 	}
 }
 
-func (s *Server) filesSortBySize(method SortMethod) {
+func (s *Server) sortByFileSize(method SortMethod) {
 	switch method {
 	case SORT_ASCENDING:
-		sort.Slice(s.Files, func(i, j int) bool {
-			return s.Files[i].Size < s.Files[j].Size
+		sort.Slice(s.files, func(i, j int) bool {
+			return s.files[i].Size < s.files[j].Size
 		})
 		return
 	case SORT_DESCENDING:
-		sort.Slice(s.Files, func(i, j int) bool {
-			return s.Files[i].Size > s.Files[j].Size
+		sort.Slice(s.files, func(i, j int) bool {
+			return s.files[i].Size > s.files[j].Size
 		})
 		return
 	}
 }
 
-func (s *Server) filesSortByTime(method SortMethod) {
+func (s *Server) sortByFileTime(method SortMethod) {
 	switch method {
 	case SORT_ASCENDING:
-		sort.Slice(s.Files, func(i, j int) bool {
-			return s.Files[i].ModTime.Before(s.Files[j].ModTime)
+		sort.Slice(s.files, func(i, j int) bool {
+			return s.files[i].ModTime.Before(s.files[j].ModTime)
 		})
 		return
 	case SORT_DESCENDING:
-		sort.Slice(s.Files, func(i, j int) bool {
-			return s.Files[i].ModTime.After(s.Files[j].ModTime)
+		sort.Slice(s.files, func(i, j int) bool {
+			return s.files[i].ModTime.After(s.files[j].ModTime)
 		})
 		return
 	}
 }
 
 func (s *Server) parentFiles() []File {
-	if isExistDirectory(path.Join(s.Directory, "..")) && s.UrlPath != "/" {
+	if isExistDirectory(path.Join(s.directory, "..")) && s.urlPath != "/" {
 		var files []File
 		return append(files, File{
 			Name:  "..",
@@ -832,47 +882,101 @@ func (s *Server) readDirectoryFiles(f *os.File) ([]File, error) {
 			IsDir:         f.IsDir(),
 			Size:          f.Size(),
 			ModTime:       f.ModTime(),
-			ModTimeString: s.TimeHelper.ParseTime(f.ModTime()),
-			SizeString:    FileSize(f.Size()),
+			ModTimeString: s.timeHelper.parseTime(f.ModTime()),
+			SizeString:    fileSize(f.Size()),
 		})
 	}
 	return files, err
 }
 
+func (s *Server) browserOpen(url string) error {
+	var err error
+	openCmd := s.config.OPEN_CMD
+	if openCmd != "" {
+		exec.Command(openCmd, url).Output()
+	} else {
+		switch runtime.GOOS {
+		case "linux":
+			_, err = exec.Command("xdg-open", url).Output()
+			return err
+		case "windows":
+			_, err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Output()
+			return err
+		case "darwin":
+			_, err := exec.Command("open", url).Output()
+			return err
+		default:
+			return fmt.Errorf("Can't suggest platform\nPlease nset os environment $OPEN_CMD")
+		}
+	}
+	return nil
+}
+
+func (s *Server) isBasicAuthorized(r *http.Request) bool {
+	user, pw, ok := r.BasicAuth()
+	return ok && user == s.config.FS_AUTH_USER && pw == s.config.FS_AUTH_PASSWORD
+}
+
+func (s *Server) isIpAuthorized(r *http.Request) (bool, error) {
+	authed := false
+	remoteIp, err := getHttpRequestIpAddress(r)
+	if err != nil {
+		return authed, err
+	}
+	if s.config.FS_ADMIN_IP == "" {
+		localIps, err := getLocalIps()
+		if err != nil {
+			return authed, err
+		}
+		for _, l := range localIps {
+			if remoteIp.Equal(l) {
+				authed = true
+				return authed, err
+			}
+		}
+	} else {
+		adminIp := net.ParseIP(s.config.FS_ADMIN_IP)
+		authed = remoteIp.Equal(adminIp)
+	}
+	return authed, err
+}
+
 // timeHelper
-func newTimeHelper(locationName string) (*TimeHelper, error) {
+func newTimeHelper(locationName string, timeFormat string) (*TimeHelper, error) {
 	location, err := time.LoadLocation(locationName)
 	return &TimeHelper{
-		Location: location,
-		Now:      time.Now().In(location),
+		location:   location,
+		now:        time.Now().In(location),
+		timeFormat: timeFormat,
 	}, err
 }
 
-func (timeh TimeHelper) ParseTime(t time.Time) string {
-	return t.Format(configs.FS_TIME_FORMAT)
+func (timeh TimeHelper) parseTime(t time.Time) string {
+	return t.Format(timeh.timeFormat)
 }
 
 // frecency
-func newFrecency(path string) (*Frecency, error) {
+func newFrecency(path string) *Frecency {
 	return &Frecency{
-		Comma: '|',
-	}, nil
+		comma:    '|',
+		filePath: path,
+	}
 }
 
 func (f *Frecency) read() error {
 	var items []FrecencyFileItem
-	r, err := os.ReadFile(configs.FS_FILEDB_PATH)
+	r, err := os.ReadFile(f.filePath)
 	if err != nil {
-		return fmt.Errorf("Counld not read file path: %s, err %v", configs.FS_FILEDB_PATH, err)
+		return fmt.Errorf("Counld not read file path: %s, err %v", f.filePath, err)
 	}
 
 	cr := csv.NewReader(bytes.NewReader(r))
-	mutex.RLock()
-	cr.Comma = f.Comma
+	f.RLock()
+	cr.Comma = f.comma
 	csvs, err := cr.ReadAll()
-	mutex.RUnlock()
+	f.RUnlock()
 	if err != nil {
-		return fmt.Errorf("Counld not read csv: %s, err %v", configs.FS_FILEDB_PATH, err)
+		return fmt.Errorf("Counld not read csv: %s, err %v", f.filePath, err)
 	}
 
 	for _, c := range csvs {
@@ -895,7 +999,7 @@ func (f *Frecency) read() error {
 		}
 	}
 
-	f.FrecencyFileItems = items
+	f.frecencyFileItems = items
 	return err
 }
 
@@ -911,29 +1015,29 @@ func (f *Frecency) backoff(retries int) time.Duration {
 
 func (f *Frecency) save() error {
 	var csvs [][]string
-	for _, v := range f.FrecencyFileItems {
+	for _, v := range f.frecencyFileItems {
 		csvs = append(csvs, []string{v.Path, fmt.Sprintf("%d", v.Rank), fmt.Sprintf("%d", v.TimeStamp)})
 	}
-	mutex.RLock()
-	fs, err := os.Create(configs.FS_FILEDB_PATH)
-	mutex.RUnlock()
+	f.RLock()
+	fs, err := os.Create(f.filePath)
+	f.RUnlock()
 	if err != nil {
-		return fmt.Errorf("Counld not create file path: %s, err %v", configs.FS_FILEDB_PATH, err)
+		return fmt.Errorf("Counld not create file path: %s, err %v", f.filePath, err)
 	}
 
 	retries := 5
 	for i := 0; i < retries; i++ {
 		w := csv.NewWriter(fs)
-		mutex.Lock()
-		w.Comma = f.Comma
+		f.Lock()
+		w.Comma = f.comma
 		err = w.WriteAll(csvs)
-		mutex.Unlock()
+		f.Unlock()
 		if err == nil {
 			return nil
 		}
 		f.backoff(i)
 	}
-	return fmt.Errorf("Counld not write file path: %s, err %v", configs.FS_FILEDB_PATH, err)
+	return fmt.Errorf("Counld not write file path: %s, err %v", f.filePath, err)
 }
 
 func (f *Frecency) add(path string) error {
@@ -952,7 +1056,7 @@ func (f *Frecency) add(path string) error {
 	}
 
 	isExist := false
-	for _, v := range f.FrecencyFileItems {
+	for _, v := range f.frecencyFileItems {
 		if v.Path == path {
 			v.Rank = v.Rank + 1
 			v.TimeStamp = int(time.Now().Unix())
@@ -963,10 +1067,10 @@ func (f *Frecency) add(path string) error {
 			newItems = append(newItems, v)
 		}
 	}
-	f.FrecencyFileItems = newItems
+	f.frecencyFileItems = newItems
 
 	if !isExist {
-		f.FrecencyFileItems = append(newItems, FrecencyFileItem{
+		f.frecencyFileItems = append(newItems, FrecencyFileItem{
 			Path:      path,
 			Rank:      1,
 			TimeStamp: int(time.Now().Unix()),
@@ -984,7 +1088,7 @@ func (f *Frecency) frecent(rank int, time int, now int) int {
 func (f *Frecency) clean() error {
 	var newItems []FrecencyFileItem
 
-	for _, v := range f.FrecencyFileItems {
+	for _, v := range f.frecencyFileItems {
 		now := int(time.Now().Unix())
 		score := f.frecent(v.Rank, v.TimeStamp, now)
 
@@ -992,7 +1096,7 @@ func (f *Frecency) clean() error {
 			newItems = append(newItems, v)
 		}
 	}
-	f.FrecencyFileItems = newItems
+	f.frecencyFileItems = newItems
 
 	if err := f.save(); err != nil {
 		return fmt.Errorf("Failed save frecency file items: %v", err)
@@ -1003,12 +1107,12 @@ func (f *Frecency) clean() error {
 func (f *Frecency) getFrecs(limit int) []Frec {
 	var frecs []Frec
 
-	for i, v := range f.FrecencyFileItems {
+	for i, v := range f.frecencyFileItems {
 		now := int(time.Now().Unix())
 		score := f.frecent(v.Rank, v.TimeStamp, now)
 		frecs = append(frecs, Frec{
-			Score: score,
-			Path:  v.Path,
+			score: score,
+			path:  v.Path,
 		})
 
 		if i == limit-1 {
@@ -1017,57 +1121,158 @@ func (f *Frecency) getFrecs(limit int) []Frec {
 	}
 
 	sort.Slice(frecs, func(i, j int) bool {
-		return frecs[i].Score > frecs[j].Score
+		return frecs[i].score > frecs[j].score
 	})
 	return frecs
+}
+
+// RateLimiter
+func newRateLimiter(limitCount int, interval int) *RateLimiter {
+	return &RateLimiter{
+		entry:      make(map[string]int),
+		limitCount: limitCount,
+		interval:   interval,
+		ctx:        context.Background(),
+		done:       make(chan struct{}),
+	}
+}
+
+func (r *RateLimiter) set(key string, value int) {
+	r.Lock()
+	defer r.Unlock()
+	r.entry[key] = value
+}
+
+func (r *RateLimiter) get(key string) (int, bool) {
+	r.RLock()
+	defer r.RUnlock()
+	value, ok := r.entry[key]
+	return value, ok
+}
+
+func (r *RateLimiter) del(key string) {
+	r.Lock()
+	defer r.Unlock()
+	delete(r.entry, key)
+}
+
+func (r *RateLimiter) flushall() {
+	r.Lock()
+	defer r.Unlock()
+	r.entry = make(map[string]int)
+}
+
+func (r *RateLimiter) increment(key string) int {
+	v, ok := r.get(key)
+	nv := v + 1
+	if !ok {
+		r.set(key, 1)
+	} else {
+		r.set(key, nv)
+	}
+	return nv
+}
+
+func (r *RateLimiter) isRateLimited(key string) bool {
+	v, ok := r.get(key)
+	if !ok {
+		r.set(key, 1)
+	} else {
+		if v < r.limitCount {
+			return false
+		} else {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *RateLimiter) runClearRateLimitWorker() {
+	go func() {
+		ticker := time.NewTicker(time.Duration(r.interval) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				r.flushall()
+			case <-r.done:
+				r.flushall()
+				return
+			case <-r.ctx.Done():
+				r.stopClearRateLimitWorker()
+			}
+		}
+	}()
+}
+
+func (r *RateLimiter) stopClearRateLimitWorker() {
+	r.once.Do(func() {
+		close(r.done)
+	})
 }
 
 // functions
 func setOptions() {
 	flag.CommandLine.Init("fs", flag.ExitOnError)
 	flagSet = flag.NewFlagSet("fs", flag.ExitOnError)
-	flagSet.StringVar(&options.ServerHost, "h", "127.0.0.1", "file server hostname")
-	flagSet.StringVar(&options.ServerPort, "p", "8080", "file server port")
-	flagSet.StringVar(&options.LocationName, "l", "Asia/Tokyo", "time loation")
-	flagSet.BoolVar(&options.Cd, "c", false, "approve change base directory, not recommended")
-	flagSet.BoolVar(&options.Simple, "s", false, "render simple, only file names")
-	flagSet.BoolVar(&options.Version, "v", false, "show version")
-	flagSet.BoolVar(&options.Debug, "d", false, "log level for debug")
-	flagSet.BoolVar(&options.Open, "o", false, "browser open on file server address")
+	flagSet.StringVar(&options.serverHost, "h", "127.0.0.1", "file server hostname")
+	flagSet.StringVar(&options.serverPort, "p", "8080", "file server port")
+	flagSet.StringVar(&options.locationName, "l", "Asia/Tokyo", "time loation")
+	flagSet.BoolVar(&options.cd, "c", false, "approve change base directory, not recommended")
+	flagSet.BoolVar(&options.simple, "s", false, "render simple, only file names")
+	flagSet.BoolVar(&options.version, "v", false, "show version")
+	flagSet.BoolVar(&options.debug, "d", false, "log level for debug")
+	flagSet.BoolVar(&options.open, "o", false, "browser open on file server address")
 }
 
-func setConfigs() error {
+func newConfig() (*Config, error) {
+	var config *Config
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = os.Getenv("HOME")
 		if home == "" {
-			return fmt.Errorf("User HOME directory is not found, Please set $HOME environment variable")
+			return config, fmt.Errorf("User HOME directory is not found, Please set $HOME environment variable")
 		}
 	}
 	fsTimeFormat := os.Getenv("FS_TIME_FORMAT")
 	if fsTimeFormat == "" {
 		fsTimeFormat = "06/01/02 15:04:05"
 	}
-	fsFileDBPath := os.Getenv("FS_FILEDB_PATH")
-	if fsFileDBPath == "" {
-		fsFileDBPath = filepath.Join(home, ".fs")
+	fsFrecencyFilePath := os.Getenv("FS_FRECENCY_FILE_PATH")
+	if fsFrecencyFilePath == "" {
+		fsFrecencyFilePath = filepath.Join(home, ".fs")
 	}
-
-	configs = Configs{
-		HOME:             home,
-		OPEN_CMD:         os.Getenv("OPEN_CMD"),
-		FS_ADMIN_IP:      os.Getenv("FS_ADMIN_IP"),
-		FS_AUTH_PATH:     os.Getenv("FS_AUTH_PATH"),
-		FS_AUTH_USER:     os.Getenv("FS_AUTH_USER"),
-		FS_AUTH_PASSWORD: os.Getenv("FS_AUTH_PASSWORD"),
-		FS_FILEDB_PATH:   fsFileDBPath,
-		FS_TIME_FORMAT:   fsTimeFormat,
+	var fsRateLimitInterval int
+	fsRateLimitIntervalStr := os.Getenv("FS_RATE_LIMIT_INTERVAL")
+	if v, err := strconv.Atoi(fsRateLimitIntervalStr); err != nil || fsRateLimitIntervalStr == "" {
+		fsRateLimitInterval = 600
+	} else {
+		fsRateLimitInterval = v
 	}
-	return nil
+	var fsRateLimitCount int
+	fsRateLimitCountStr := os.Getenv("FS_RATE_LIMIT_COUNT")
+	if v, err := strconv.Atoi(fsRateLimitCountStr); err != nil || fsRateLimitCountStr == "" {
+		fsRateLimitCount = 300
+	} else {
+		fsRateLimitCount = v
+	}
+	config = &Config{
+		HOME:                   home,
+		OPEN_CMD:               os.Getenv("OPEN_CMD"),
+		FS_ADMIN_IP:            os.Getenv("FS_ADMIN_IP"),
+		FS_AUTH_PATH:           os.Getenv("FS_AUTH_PATH"),
+		FS_AUTH_USER:           os.Getenv("FS_AUTH_USER"),
+		FS_AUTH_PASSWORD:       os.Getenv("FS_AUTH_PASSWORD"),
+		FS_FRECENCY_FILE_PATH:  fsFrecencyFilePath,
+		FS_TIME_FORMAT:         fsTimeFormat,
+		FS_RATE_LIMIT_INTERVAL: fsRateLimitInterval,
+		FS_RATE_LIMIT_COUNT:    fsRateLimitCount,
+	}
+	return config, err
 }
 
 func showVersion() (int, error) {
-	return fmt.Printf("fs version %s", Version)
+	return fmt.Printf("fs version %s", version)
 }
 
 func isExistDirectory(path string) bool {
@@ -1080,7 +1285,7 @@ func isExistPath(path string) bool {
 	return !os.IsNotExist(err)
 }
 
-func FileSize(s int64) string {
+func fileSize(s int64) string {
 	if s < 1024 {
 		return fmt.Sprintf("%d", s)
 	}
@@ -1124,29 +1329,6 @@ func splitPath(path string) []string {
 	return s
 }
 
-func browserOpen(url string) error {
-	var err error
-	openCmd := configs.OPEN_CMD
-	if openCmd != "" {
-		exec.Command(openCmd, url).Output()
-	} else {
-		switch runtime.GOOS {
-		case "linux":
-			_, err = exec.Command("xdg-open", url).Output()
-			return err
-		case "windows":
-			_, err = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Output()
-			return err
-		case "darwin":
-			_, err := exec.Command("open", url).Output()
-			return err
-		default:
-			return fmt.Errorf("Can't suggest platform\nPlease nset os environment $OPEN_CMD")
-		}
-	}
-	return nil
-}
-
 func getHttpRequestIpAddress(r *http.Request) (net.IP, error) {
 	var err error
 	remoteAddr := strings.TrimSpace(r.Header.Get("X-Real-IP"))
@@ -1159,8 +1341,8 @@ func getHttpRequestIpAddress(r *http.Request) (net.IP, error) {
 func getLocalIps() ([]net.IP, error) {
 	var ips []net.IP
 	var err error
-	if len(localIPs) > 0 {
-		return localIPs, err
+	if len(localIps) > 0 {
+		return localIps, err
 	}
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -1194,18 +1376,19 @@ func main() {
 	flagSet.Parse(os.Args[1:])
 	args := flagSet.Args()
 
-	// set configs
-	if err := setConfigs(); err != nil {
-		log.Fatalf("Failed set configs %v", err)
+	// set config
+	config, err := newConfig()
+	if err != nil {
+		log.Fatalf("Failed set config %v", err)
 	}
 
 	// set log level
-	if options.Debug {
+	if options.debug {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
 	}
 
 	// when version
-	if options.Version {
+	if options.version {
 		showVersion()
 		os.Exit(0)
 	}
@@ -1223,16 +1406,14 @@ func main() {
 	}
 
 	// server
-	server, err := newServer(dir)
+	server, err := newServer(dir, config)
 	if err != nil {
 		log.Fatalf("Failed initialize server %v", err)
 	}
 
-	if err = server.serve(); err != nil {
-		if err != http.ErrServerClosed {
-			log.Fatalf("Failed at serve %v", err)
-		} else {
-			log.Printf("Server closed gracefully")
-		}
+	if err = server.serve(); err != nil || err != http.ErrServerClosed {
+		log.Printf("Server closed gracefully")
+	} else {
+		log.Fatalf("Failed at serve %v", err)
 	}
 }
