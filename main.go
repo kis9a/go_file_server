@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
+	"container/list"
 	"context"
 	"encoding/csv"
+	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"html/template"
 	"io"
+	"io/fs"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
@@ -29,40 +35,48 @@ import (
 )
 
 type Config struct {
-	HOME                   string
-	OPEN_CMD               string
-	FS_AUTH_PATH           string
-	FS_AUTH_USER           string
-	FS_AUTH_PASSWORD       string
-	FS_ADMIN_IP            string
-	FS_TIME_FORMAT         string
-	FS_FRECENCY_FILE_PATH  string
-	FS_RATE_LIMIT_COUNT    int
-	FS_RATE_LIMIT_INTERVAL int
+	HOME                             string
+	FS_ACCESS_LOG_EVICTION_INTERVAL  int
+	FS_ACCESS_LOG_DIRECTORY          string
+	FS_ADMIN_IP                      string
+	FS_AUTH_PASSWORD                 string
+	FS_AUTH_PATH                     string
+	FS_AUTH_USER                     string
+	FS_CHANGE_DIRECTORY              bool
+	FS_CORS_ORIGINS                  string
+	FS_DEBUG_MODE                    bool
+	FS_FRECENCY_FILE_PATH            string
+	FS_OPEN_CMD                      string
+	FS_OPEN_MODE                     bool
+	FS_RATE_LIMIT_COUNT              int
+	FS_RATE_LIMIT_EVICTION_FILE_PATH string
+	FS_RATE_LIMIT_INTERVAL           int
+	FS_SERVER_HOST                   string
+	FS_SERVER_PORT                   string
+	FS_SIMPLE_MODE                   bool
+	FS_TIME_FORMAT                   string
 }
 
-type Options struct {
-	serverPort   string
-	serverHost   string
-	locationName string
-	cd           bool
-	simple       bool
-	version      bool
-	debug        bool
-	open         bool
+type CommandOption struct {
+	serverPort string
+	serverHost string
+	simple     bool
+	cd         bool
+	debug      bool
+	open       bool
 }
 
 type Server struct {
-	address     string
-	directory   string
-	path        string
-	urlPath     string
-	query       url.Values
-	files       []File
-	config      *Config
-	frecency    *Frecency
-	rateLimiter *RateLimiter
-	timeHelper  *TimeHelper
+	address      string
+	directory    string
+	path         string
+	urlPath      string
+	query        url.Values
+	files        []File
+	config       *Config
+	frecency     *Frecency
+	accessLogger *AccessLogger
+	rateLimiter  *RateLimiter
 }
 
 type File struct {
@@ -75,23 +89,52 @@ type File struct {
 }
 
 type RateLimiter struct {
-	sync.RWMutex
-	limitCount int
-	interval   int
-	ctx        context.Context
-	once       sync.Once
-	done       chan struct{}
-	entry      map[string]int
+	mutex            sync.RWMutex
+	limitCount       int
+	interval         int
+	evictionFilePath string
+	entry            map[string]int
+	ctx              context.Context
+	once             sync.Once
+	done             chan struct{}
+	lastCleanedTime  time.Time
 }
 
-type TimeHelper struct {
-	location   *time.Location
-	now        time.Time
-	timeFormat string
+type RateLimiterEvictionHeader struct {
+	LastCleanedTime time.Time
+	StopTime        time.Time
+	Interval        int
+	LimitCount      int
+}
+
+type RateLimiterEviction struct {
+	Header RateLimiterEvictionHeader
+	Entry  map[string]int
+}
+
+type AccessLogger struct {
+	mutex                sync.RWMutex
+	ctx                  context.Context
+	done                 chan struct{}
+	entry                *list.List
+	evictionFileFormat   string
+	evictionFile         *os.File
+	maxEvicationFileSize int64
+	evictionInterval     int
+	logDirPath           string
+	once                 sync.Once
+}
+
+type AccessLog struct {
+	RmoteAddr  string `json:"remoteAddr"`
+	Method     string `json:"method"`
+	URL        string `json:"url"`
+	Referer    string `json:"referer"`
+	UserAgenet string `json:"userAgenet"`
 }
 
 type Frecency struct {
-	sync.RWMutex
+	mutex             sync.RWMutex
 	frecs             []Frec
 	frecencyFileItems []FrecencyFileItem
 	filePath          string
@@ -128,7 +171,6 @@ const (
 
 var (
 	flagSet  *flag.FlagSet
-	options  Options
 	localIps []net.IP
 
 	// set at go build -ldflags '-X main.version=xxx'
@@ -144,38 +186,31 @@ func newServer(dir string, config *Config) (*Server, error) {
 	}
 
 	// check tcp addr
-	addr := net.JoinHostPort(options.serverHost, options.serverPort)
+	addr := net.JoinHostPort(config.FS_SERVER_HOST, config.FS_SERVER_PORT)
 	_, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
-		return server, fmt.Errorf("Listen addr could not resolve: %s", addr)
+		return server, fmt.Errorf("Listen addr could not resolve: %s\n", addr)
 	} else {
 		server.address = addr
 	}
 
-	// iniitalize timeh
-	timeh, err := newTimeHelper(options.locationName, config.FS_TIME_FORMAT)
-	if err != nil {
-		return server, fmt.Errorf("Failed initialize time helper: %v", err)
-	} else {
-		server.timeHelper = timeh
-	}
+	// initialize acess logger
+	server.accessLogger = newAccessLogger(config.FS_ACCESS_LOG_EVICTION_INTERVAL, config.FS_ACCESS_LOG_DIRECTORY)
 
 	// initialize rateLimiter
-	server.rateLimiter = newRateLimiter(config.FS_RATE_LIMIT_COUNT, config.FS_RATE_LIMIT_INTERVAL)
+	server.rateLimiter = newRateLimiter(config.FS_RATE_LIMIT_COUNT, config.FS_RATE_LIMIT_INTERVAL, config.FS_RATE_LIMIT_EVICTION_FILE_PATH)
 
 	// initialize frecency
 	if !isExistPath(config.FS_FRECENCY_FILE_PATH) {
-		_, err := os.Create(config.FS_FRECENCY_FILE_PATH)
+		f, err := os.Create(config.FS_FRECENCY_FILE_PATH)
 		if err != nil {
-			return server, fmt.Errorf("Failed initialize FrecencyFileDB path: %s, err: %v", config.FS_FRECENCY_FILE_PATH, err)
+			return server, fmt.Errorf("Failed initialize FrecencyFileDB path: %s, err: %v\n", config.FS_FRECENCY_FILE_PATH, err)
 		}
+		defer f.Close()
 	}
 	server.frecency = newFrecency(config.FS_FRECENCY_FILE_PATH)
-	if err := server.frecency.add(server.directory); err != nil {
-		return server, fmt.Errorf("Failed frecency add path: %s, err: %v", server.directory, err)
-	}
 	if err := server.frecency.clean(); err != nil {
-		return server, fmt.Errorf("Failed frecency clean err: %v", err)
+		return server, fmt.Errorf("Failed frecency clean err: %v\n", err)
 	}
 	return server, err
 }
@@ -185,18 +220,20 @@ func (s *Server) serve() error {
 	mux := s.routeHandler()
 	log.Printf("Serving %s at %s", s.directory, s.address)
 
-	if options.open {
+	if s.config.FS_OPEN_MODE {
 		err := s.browserOpen("http://" + s.address)
 		if err != nil {
-			os.Stderr.WriteString("Failed browser open: " + err.Error())
+			os.Stderr.WriteString("Failed browser open: " + err.Error() + "\n")
 		}
 	}
 
-	// context rate limit worker
-	ctxRateLimiter, cancelRateLimiter := context.WithCancel(context.Background())
-	s.rateLimiter.ctx = ctxRateLimiter
-	s.rateLimiter.runClearRateLimitWorker()
-	defer cancelRateLimiter()
+	// run access log eviction worker
+	s.accessLogger.runEvictioner()
+	defer s.accessLogger.stopEvictionWorker()
+
+	// run rate limit clean worker
+	s.rateLimiter.runLimitCleaner()
+	defer s.rateLimiter.stoplimitCleanWorker()
 
 	// server with graceful shutdown
 	httpServer := &http.Server{
@@ -211,7 +248,7 @@ func (s *Server) serve() error {
 	go func() {
 		if err = httpServer.ListenAndServe(); err != nil {
 			if err != http.ErrServerClosed {
-				os.Stderr.WriteString("Failed on Listen And Server, error: " + err.Error())
+				os.Stderr.WriteString("Failed on Listen And Server, error: " + err.Error() + "\n")
 			}
 		}
 	}()
@@ -222,9 +259,8 @@ func (s *Server) serve() error {
 	defer serverCancel()
 
 	if err = httpServer.Shutdown(serverCtx); err != nil {
-		return fmt.Errorf("Failed gracefully shutdown err: %v", err)
+		return fmt.Errorf("Failed gracefully shutdown err: %v\n", err)
 	}
-
 	return err
 }
 
@@ -256,10 +292,12 @@ func (s *Server) routeHandler() *http.ServeMux {
 }
 
 func (s *Server) commonMiddlewares(h http.Handler) http.Handler {
-	return s.middlewareUrlParser(
-		s.middlewareAccessLogger(
-			s.middlewareRateLimiter(
-				s.middlewareBasicAuthenticator(h),
+	return s.middlewareCors(
+		s.middlewareUrlParser(
+			s.middlewareAccessLogger(
+				s.middlewareRateLimiter(
+					s.middlewareBasicAuthenticator(h),
+				),
 			),
 		),
 	)
@@ -283,13 +321,33 @@ func (s *Server) middlewareUrlParser(h http.Handler) http.Handler {
 func (s *Server) middlewareAccessLogger(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s: %s %s", r.RemoteAddr, r.Method, r.Host+r.RequestURI)
+		s.accessLogger.pushBack(AccessLog{
+			RmoteAddr:  r.RemoteAddr,
+			Method:     r.Method,
+			URL:        r.URL.RequestURI(),
+			Referer:    r.Referer(),
+			UserAgenet: r.UserAgent(),
+		})
+		h.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) middlewareCors(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", s.config.FS_CORS_ORIGINS)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		h.ServeHTTP(w, r)
 	})
 }
 
 func (s *Server) middlewareRateLimiter(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ip, err := getHttpRequestIpAddress(r)
+		ip, err := getReqIpAddress(r)
 		if err != nil {
 			os.Stderr.WriteString(fmt.Sprintf("Failed get remote IP: %v\n", err))
 		}
@@ -298,7 +356,7 @@ func (s *Server) middlewareRateLimiter(h http.Handler) http.Handler {
 			http.Error(w, fmt.Sprintf("Rate Lmited, ip: %s\n", ip), http.StatusTooManyRequests)
 			return
 		} else {
-			s.rateLimiter.increment(ip.String())
+			s.rateLimiter.incrementCount(ip.String())
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -336,7 +394,7 @@ func (s *Server) middlewareIpAuthorizer(h http.Handler) http.Handler {
 			return
 		}
 		if !authed {
-			ip, err := getHttpRequestIpAddress(r)
+			ip, err := getReqIpAddress(r)
 			if err != nil {
 				os.Stderr.WriteString(fmt.Sprintf("Failed get remote IP: %v\n", err))
 			}
@@ -357,7 +415,7 @@ func (s *Server) middlewareFrecency(h http.Handler) http.Handler {
 			if r.Method == http.MethodGet {
 				if pathBefore != s.path && isExistDirectory(s.path) {
 					if err := s.frecency.add(s.path); err != nil {
-						os.Stderr.WriteString(fmt.Sprintf("Failed frecency add path: %s, err: %v", s.path, err))
+						os.Stderr.WriteString(fmt.Sprintf("Failed frecency add path: %s, err: %v\n", s.path, err))
 					}
 				}
 				s.handleServer(w, r)
@@ -439,12 +497,12 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 
 	// check path exsits
 	f, err := os.Open(p)
-	defer f.Close()
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed to open path, err: %v\n", err))
 		http.Error(w, fmt.Sprintf("Failed to open path, err: %v", err), http.StatusInternalServerError)
 		return
 	}
+	defer f.Close()
 
 	fs, err := f.Stat()
 	if fs.IsDir() {
@@ -467,7 +525,7 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 			IsDir:         fs.IsDir(),
 			Size:          fs.Size(),
 			ModTime:       fs.ModTime(),
-			ModTimeString: s.timeHelper.parseTime(fs.ModTime()),
+			ModTimeString: fs.ModTime().Format(s.config.FS_TIME_FORMAT),
 			SizeString:    fileSize(fs.Size()),
 		})
 		if err != nil {
@@ -488,12 +546,12 @@ func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f, err := os.Open(s.path)
-	defer f.Close()
 	if err != nil {
 		os.Stderr.WriteString(fmt.Sprintf("Failed to open path %v\n", err))
 		http.Error(w, fmt.Sprintf("Failed to open path %v", err), http.StatusInternalServerError)
 		return
 	}
+	defer f.Close()
 
 	if isExistDirectory(s.path) {
 		s.files, err = s.readDirectoryFiles(f)
@@ -676,13 +734,13 @@ func (s *Server) adaptLayout(w http.ResponseWriter, body string) (string, error)
 
 func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	html, err := os.Open(path.Join(s.path, "index.html"))
-
 	if err == nil {
 		io.Copy(w, html)
 		os.Stderr.WriteString(fmt.Sprintf("Failed write index.html %v\n", err))
 		html.Close()
 		return err
 	}
+	defer html.Close()
 	html.Close()
 
 	absDir, err := filepath.Abs(s.directory)
@@ -735,13 +793,13 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	}
 
 	wb.WriteString("</div>\n<ul>\n")
-	if options.simple {
+	if s.config.FS_SIMPLE_MODE {
 		wb.WriteString("<li class=\"colh\"><div><span onclick=\"s('name')\">FILES</span></div></li>\n")
 	} else {
 		wb.WriteString("<li class=\"colh\"><div><span onclick=\"s('name')\">FILES</span></div>\n<div><span onclick=\"s('size')\">SIZE</span></div>\n<div><span onclick=\"s('time')\">TIME</span></div></li>\n")
 	}
 
-	if s.directory != "/" && s.urlPath == "/" && options.cd {
+	if s.directory != "/" && s.urlPath == "/" && s.config.FS_CHANGE_DIRECTORY {
 		wb.WriteString(fmt.Sprintf("<li><span class=\"up\" onclick=\"cd('..')\">%s/</span></li>\n", ".."))
 	}
 
@@ -754,13 +812,13 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 		fiPath := filepath.Join(url.PathEscape(fi.Name))
 
 		if fi.IsDir {
-			if options.simple {
+			if s.config.FS_SIMPLE_MODE {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s/</a></span></li>\n", fiPath, queryString, fi.Name))
 			} else {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s/</a></span><span class=\"size\">%s</span><span class=\"modTime\">%s</span></li>\n", fiPath, queryString, fi.Name, fi.SizeString, fi.ModTimeString))
 			}
 		} else {
-			if options.simple {
+			if s.config.FS_SIMPLE_MODE {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s</a></span></li>\n", fiPath, queryString, fi.Name))
 			} else {
 				wb.WriteString(fmt.Sprintf("<li><span><a href=\"%s/%s\">%s</a></span><span class=\"size\">%s</span><span class=\"modTime\">%s</span></li>\n", fiPath, queryString, fi.Name, fi.SizeString, fi.ModTimeString))
@@ -769,7 +827,7 @@ func (s *Server) renderDirectory(f *os.File, w http.ResponseWriter) error {
 	}
 	wb.WriteString("</ul>\n")
 
-	if options.cd {
+	if s.config.FS_CHANGE_DIRECTORY {
 		wb.WriteString("<ul>\n")
 		wb.WriteString("<li class=\"frecs colh\"><div><span onclick=\"frecs()\">FRECS</span></div></li>\n")
 		for _, fi := range s.frecency.getFrecs(30) {
@@ -882,7 +940,7 @@ func (s *Server) readDirectoryFiles(f *os.File) ([]File, error) {
 			IsDir:         f.IsDir(),
 			Size:          f.Size(),
 			ModTime:       f.ModTime(),
-			ModTimeString: s.timeHelper.parseTime(f.ModTime()),
+			ModTimeString: f.ModTime().Format(s.config.FS_TIME_FORMAT),
 			SizeString:    fileSize(f.Size()),
 		})
 	}
@@ -891,7 +949,7 @@ func (s *Server) readDirectoryFiles(f *os.File) ([]File, error) {
 
 func (s *Server) browserOpen(url string) error {
 	var err error
-	openCmd := s.config.OPEN_CMD
+	openCmd := s.config.FS_OPEN_CMD
 	if openCmd != "" {
 		exec.Command(openCmd, url).Output()
 	} else {
@@ -906,7 +964,7 @@ func (s *Server) browserOpen(url string) error {
 			_, err := exec.Command("open", url).Output()
 			return err
 		default:
-			return fmt.Errorf("Can't suggest platform\nPlease nset os environment $OPEN_CMD")
+			return fmt.Errorf("Can't suggest platform\nPlease nset os environment $OPEN_CMD\n")
 		}
 	}
 	return nil
@@ -919,7 +977,7 @@ func (s *Server) isBasicAuthorized(r *http.Request) bool {
 
 func (s *Server) isIpAuthorized(r *http.Request) (bool, error) {
 	authed := false
-	remoteIp, err := getHttpRequestIpAddress(r)
+	remoteIp, err := getReqIpAddress(r)
 	if err != nil {
 		return authed, err
 	}
@@ -941,20 +999,6 @@ func (s *Server) isIpAuthorized(r *http.Request) (bool, error) {
 	return authed, err
 }
 
-// timeHelper
-func newTimeHelper(locationName string, timeFormat string) (*TimeHelper, error) {
-	location, err := time.LoadLocation(locationName)
-	return &TimeHelper{
-		location:   location,
-		now:        time.Now().In(location),
-		timeFormat: timeFormat,
-	}, err
-}
-
-func (timeh TimeHelper) parseTime(t time.Time) string {
-	return t.Format(timeh.timeFormat)
-}
-
 // frecency
 func newFrecency(path string) *Frecency {
 	return &Frecency{
@@ -967,27 +1011,27 @@ func (f *Frecency) read() error {
 	var items []FrecencyFileItem
 	r, err := os.ReadFile(f.filePath)
 	if err != nil {
-		return fmt.Errorf("Counld not read file path: %s, err %v", f.filePath, err)
+		return fmt.Errorf("Counld not read file path: %s, err %v\n", f.filePath, err)
 	}
 
 	cr := csv.NewReader(bytes.NewReader(r))
-	f.RLock()
+	f.mutex.RLock()
 	cr.Comma = f.comma
 	csvs, err := cr.ReadAll()
-	f.RUnlock()
+	f.mutex.RUnlock()
 	if err != nil {
-		return fmt.Errorf("Counld not read csv: %s, err %v", f.filePath, err)
+		return fmt.Errorf("Counld not read csv: %s, err %v\n", f.filePath, err)
 	}
 
 	for _, c := range csvs {
 		if len(c) == 3 {
 			rank, err := strconv.Atoi(c[1])
 			if err != nil {
-				os.Stdout.WriteString("Ignore invalid type column `rank`: %s" + c[1])
+				os.Stdout.WriteString("Ignore invalid type column `rank`: %s" + c[1] + "\n")
 			}
 			timeStamp, err := strconv.Atoi(c[2])
 			if err != nil {
-				os.Stdout.WriteString("Ignore invalid type column `timeStamp`: %s" + c[1])
+				os.Stdout.WriteString("Ignore invalid type column `timeStamp`: %s" + c[1] + "\n")
 			}
 			items = append(items, FrecencyFileItem{
 				Path:      c[0],
@@ -1018,26 +1062,26 @@ func (f *Frecency) save() error {
 	for _, v := range f.frecencyFileItems {
 		csvs = append(csvs, []string{v.Path, fmt.Sprintf("%d", v.Rank), fmt.Sprintf("%d", v.TimeStamp)})
 	}
-	f.RLock()
+	f.mutex.RLock()
 	fs, err := os.Create(f.filePath)
-	f.RUnlock()
 	if err != nil {
-		return fmt.Errorf("Counld not create file path: %s, err %v", f.filePath, err)
+		return fmt.Errorf("Counld not create file path: %s, err %v\n", f.filePath, err)
 	}
-
+	f.mutex.RUnlock()
+	defer fs.Close()
 	retries := 5
 	for i := 0; i < retries; i++ {
 		w := csv.NewWriter(fs)
-		f.Lock()
+		f.mutex.Lock()
 		w.Comma = f.comma
 		err = w.WriteAll(csvs)
-		f.Unlock()
+		f.mutex.Unlock()
 		if err == nil {
 			return nil
 		}
 		f.backoff(i)
 	}
-	return fmt.Errorf("Counld not write file path: %s, err %v", f.filePath, err)
+	return fmt.Errorf("Counld not write file path: %s, err %v\n", f.filePath, err)
 }
 
 func (f *Frecency) add(path string) error {
@@ -1047,12 +1091,12 @@ func (f *Frecency) add(path string) error {
 	if !filepath.IsAbs(path) {
 		path, err = filepath.Abs(path)
 		if err != nil {
-			return fmt.Errorf("Failed make absolute path: %s, err: %v", path, err)
+			return fmt.Errorf("Failed make absolute path: %s, err: %v\n", path, err)
 		}
 	}
 
 	if err := f.read(); err != nil {
-		return fmt.Errorf("Failed read fracs path: %s, err: %v", path, err)
+		return fmt.Errorf("Failed read fracs path: %s, err: %v\n", path, err)
 	}
 
 	isExist := false
@@ -1099,7 +1143,7 @@ func (f *Frecency) clean() error {
 	f.frecencyFileItems = newItems
 
 	if err := f.save(); err != nil {
-		return fmt.Errorf("Failed save frecency file items: %v", err)
+		return fmt.Errorf("Failed save frecency file items: %v\n", err)
 	}
 	return nil
 }
@@ -1126,57 +1170,421 @@ func (f *Frecency) getFrecs(limit int) []Frec {
 	return frecs
 }
 
-// RateLimiter
-func newRateLimiter(limitCount int, interval int) *RateLimiter {
-	return &RateLimiter{
-		entry:      make(map[string]int),
-		limitCount: limitCount,
-		interval:   interval,
-		ctx:        context.Background(),
-		done:       make(chan struct{}),
+// AccessLogger
+func newAccessLogger(interval int, logDirPath string) *AccessLogger {
+	return &AccessLogger{
+		ctx:                  context.Background(),
+		done:                 make(chan struct{}),
+		entry:                list.New(),
+		evictionFileFormat:   "2006-01-02",
+		evictionInterval:     interval,
+		maxEvicationFileSize: 20000000, // 20MB
+		logDirPath:           logDirPath,
+		once:                 sync.Once{},
 	}
 }
 
-func (r *RateLimiter) set(key string, value int) {
-	r.Lock()
-	defer r.Unlock()
+func (a *AccessLogger) flushallEntry() {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	a.entry = list.New()
+}
+
+func (a *AccessLogger) checkRequiredVariables() bool {
+	if a.logDirPath == "" || a.evictionInterval < 1 {
+		return false
+	} else {
+		if isExistDirectory(a.logDirPath) {
+			return true
+		} else {
+			os.Stderr.WriteString(fmt.Sprintf("No such directory, path: %s\n", a.logDirPath))
+			return false
+		}
+	}
+}
+
+func (a *AccessLogger) evictionAccessLogs() error {
+	if !a.checkRequiredVariables() {
+		return nil
+	}
+	for e := a.entry.Front(); e != nil; e = e.Next() {
+		j, err := json.Marshal(e.Value.(AccessLog))
+		if err != nil {
+			return fmt.Errorf("Failed json marshal, err: %v\n", err)
+		}
+		_, err = a.evictionFile.Write(append(j, []byte("\n")...))
+		if err != nil {
+			return fmt.Errorf("Failed write to evication file, err: %v\n", err)
+		}
+	}
+	over, err := a.isEvicationFileSizeOverMax()
+	if err != nil {
+		return fmt.Errorf("Failed check is evication file size over max, err: %v", err)
+	}
+	if over {
+		index, err := a.getEvicationFileIndex()
+		if err != nil {
+			return fmt.Errorf("Failed get evication file index, err: %v", err)
+		}
+		newIndex := index + 1
+		err = a.compressAndSaveEvictionFile(a.evictionFile.Name())
+		if err != nil {
+			return fmt.Errorf("Failed compress and save evication file, err: %v", err)
+		}
+		now := time.Now()
+		logFileName := now.Format(a.evictionFileFormat)
+		logFilePath := filepath.Join(a.logDirPath, fmt.Sprintf("%s-%d", logFileName, newIndex))
+		if f, err := os.Create(logFilePath); err != nil {
+			defer f.Close()
+			return fmt.Errorf("Failed create log file, path: %v, err: %v\n", logFilePath, err)
+		} else {
+			a.evictionFile = f
+			os.Stdout.WriteString(fmt.Sprintf("Created log file, path: %v\n", logFilePath))
+		}
+	}
+	return nil
+}
+
+func (a *AccessLogger) isEvicationFileSizeOverMax() (bool, error) {
+	fi, err := a.evictionFile.Stat()
+	if err != nil {
+		return false, err
+	}
+	if a.maxEvicationFileSize < fi.Size() {
+		return true, err
+	} else {
+		return false, err
+	}
+}
+
+func (a *AccessLogger) compressAndSaveEvictionFile(filePath string) error {
+	source, err := os.Open(filePath)
+	if err != nil {
+		return fmt.Errorf("Failed open evcation log, path: %v, err: %v\n", filePath, err)
+	}
+	defer source.Close()
+	rotatedPath := filepath.Join(filepath.Dir(filePath), "rotated")
+	if !isExistDirectory(rotatedPath) {
+		if err := os.MkdirAll(rotatedPath, os.ModePerm); err != nil {
+			return fmt.Errorf("Failed make log rotated directory, path: %v, err: %v\n", rotatedPath, err)
+		} else {
+			os.Stdout.WriteString(fmt.Sprintf("Make log rotated directory path: %v\n", rotatedPath))
+		}
+	}
+	path := filepath.Join(rotatedPath, filepath.Base(filePath)+".gz")
+	dest, err := os.Create(path)
+	if err != nil {
+		return fmt.Errorf("Failed create rotated log file path: %v, err: %v\n", path, err)
+	}
+	defer dest.Close()
+	gzipWriter := gzip.NewWriter(dest)
+	_, err = io.Copy(gzipWriter, source)
+	if err != nil {
+		return fmt.Errorf("Failed copy gzipWriter, source path: %v, path: %v, err: %v\n", filePath, path, err)
+	}
+	defer gzipWriter.Close()
+	err = os.Remove(filePath)
+	if err != nil {
+		return fmt.Errorf("Failed to remove uncompressed log file, path: %s, err: %v\n", filePath, err)
+	}
+	return err
+}
+
+func (a *AccessLogger) rotateEvictionFiles() error {
+	var err error
+	if a.evictionFile != nil {
+		return err
+	}
+	logFiles, err := a.getEvictionFiles()
+	if err != nil {
+		return fmt.Errorf("Failed get eviction files, err: %v\n", err)
+	}
+	for _, file := range logFiles {
+		if file.Name() != a.evictionFile.Name() {
+			a.compressAndSaveEvictionFile(file.Name())
+		}
+	}
+	return err
+}
+
+func (a *AccessLogger) setEvictionFile() error {
+	now := time.Now()
+	logFileName := now.Format(a.evictionFileFormat)
+	index, err := a.evictionFileLastIndex()
+	if err != nil {
+		return fmt.Errorf("Failed get log file index, err: %v\n", err)
+	}
+	logFilePath := filepath.Join(a.logDirPath, fmt.Sprintf("%s-%d", logFileName, index))
+	if !isExistPath(logFilePath) {
+		if f, err := os.Create(logFilePath); err != nil {
+			defer f.Close()
+			return fmt.Errorf("Failed create log file, path: %v, err: %v\n", logFilePath, err)
+		} else {
+			os.Stdout.WriteString(fmt.Sprintf("Created log file, path: %v\n", logFilePath))
+		}
+	}
+	file, err := os.OpenFile(logFilePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, os.ModeAppend)
+	if err != nil {
+		return fmt.Errorf("Failed open log file, err: %v\n", err)
+	}
+	a.evictionFile = file
+	return nil
+}
+
+func (a *AccessLogger) evictionFileClose() {
+	if a.evictionFile != nil {
+		a.evictionFile.Close()
+	}
+}
+
+func (a *AccessLogger) getEvictionFiles() ([]fs.FileInfo, error) {
+	files, err := ioutil.ReadDir(a.logDirPath)
+	if err != nil {
+		return files, fmt.Errorf("Failed read log directory, err: %v\n", err)
+	}
+	now := time.Now()
+	prefix := now.Format(a.evictionFileFormat)
+	var logFiles []fs.FileInfo
+	for _, file := range files {
+		if !file.IsDir() && strings.HasPrefix(file.Name(), prefix) {
+			logFiles = append(logFiles, file)
+		}
+	}
+	return logFiles, err
+}
+
+func (a *AccessLogger) getEvicationFileIndex() (int, error) {
+	str := a.evictionFile.Name()
+	if len(str) < 1 {
+		return 0, fmt.Errorf("Invalid eviction file name, name: %s", a.evictionFile.Name())
+	}
+	lastChar := string(str[len(str)-1])
+	index, err := strconv.Atoi(lastChar)
+	if err != nil {
+		return 0, fmt.Errorf("Failed parser to int, string: %v", lastChar)
+	}
+	return index, nil
+}
+
+func (a *AccessLogger) evictionFileLastIndex() (int, error) {
+	logFiles, err := a.getEvictionFiles()
+	if err != nil {
+		return 0, fmt.Errorf("Failed get eviction files, err: %v\n", err)
+	}
+	var indexes []int
+	now := time.Now()
+	prefix := now.Format(a.evictionFileFormat) + "-"
+	for _, file := range logFiles {
+		indexStr := strings.TrimPrefix(file.Name(), prefix)
+		index, err := strconv.Atoi(indexStr)
+		if err == nil {
+			indexes = append(indexes, index)
+		}
+	}
+	if len(indexes) == 0 {
+		return 0, nil
+	}
+	sort.Ints(indexes)
+	lastIndex := indexes[len(indexes)-1]
+	return lastIndex, err
+}
+
+func (a *AccessLogger) runEvictioner() error {
+	if !a.checkRequiredVariables() {
+		return nil
+	} else {
+		if err := a.setEvictionFile(); err != nil {
+			return fmt.Errorf("Failed set eviction file, err: %v\n", err)
+		}
+		if err := a.rotateEvictionFiles(); err != nil {
+			return fmt.Errorf("Failed rotate eviction files, err: %v\n", err)
+		}
+		a.runEvictionWorker()
+	}
+	return nil
+}
+
+func (a *AccessLogger) runEvictionWorker() {
+	go func() {
+		ticker := time.NewTicker(time.Duration(a.evictionInterval) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := a.evictionAccessLogs(); err != nil {
+					os.Stderr.WriteString(fmt.Sprintf("Failed evication access logs, err: %v\n", err))
+				}
+				a.flushallEntry()
+			case <-a.done:
+				if err := a.evictionAccessLogs(); err != nil {
+					os.Stderr.WriteString(fmt.Sprintf("Failed evication access logs, err: %v\n", err))
+				}
+				a.flushallEntry()
+				return
+			case <-a.ctx.Done():
+				a.stopEvictionWorker()
+			}
+		}
+	}()
+}
+
+func (a *AccessLogger) stopEvictionWorker() {
+	a.once.Do(func() {
+		if err := a.evictionAccessLogs(); err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Failed evication access logs, err: %v\n", err))
+		}
+		a.evictionFileClose()
+		close(a.done)
+	})
+}
+
+func (a *AccessLogger) pushBack(log AccessLog) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	a.entry.PushBack(log)
+}
+
+// RateLimiter
+func newRateLimiter(limitCount int, interval int, evictionFilePath string) *RateLimiter {
+	return &RateLimiter{
+		entry:            make(map[string]int),
+		limitCount:       limitCount,
+		interval:         interval,
+		evictionFilePath: evictionFilePath,
+		lastCleanedTime:  time.Now(),
+		once:             sync.Once{},
+		ctx:              context.Background(),
+		done:             make(chan struct{}),
+	}
+}
+
+func (r *RateLimiter) setCount(key string, value int) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 	r.entry[key] = value
 }
 
-func (r *RateLimiter) get(key string) (int, bool) {
-	r.RLock()
-	defer r.RUnlock()
+func (r *RateLimiter) getCount(key string) (int, bool) {
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
 	value, ok := r.entry[key]
 	return value, ok
 }
 
-func (r *RateLimiter) del(key string) {
-	r.Lock()
-	defer r.Unlock()
+func (r *RateLimiter) deleteCount(key string) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 	delete(r.entry, key)
 }
 
-func (r *RateLimiter) flushall() {
-	r.Lock()
-	defer r.Unlock()
+func (r *RateLimiter) flushallEntry() {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
 	r.entry = make(map[string]int)
 }
 
-func (r *RateLimiter) increment(key string) int {
-	v, ok := r.get(key)
+func (r *RateLimiter) applyEvictionEntry(ev RateLimiterEviction) bool {
+	if ev.Header.StopTime.IsZero() {
+		return false
+	}
+	elapsedTime := ev.Header.LastCleanedTime.Sub(ev.Header.StopTime)
+	if int(elapsedTime.Seconds()) >= ev.Header.Interval {
+		return false
+	} else {
+		r.entry = ev.Entry
+		return true
+	}
+}
+
+func (r *RateLimiter) checkRequiredVariables() bool {
+	if r.evictionFilePath == "" || r.interval < 1 || r.limitCount < 1 {
+		return false
+	} else {
+		return true
+	}
+}
+
+func (r *RateLimiter) readEvictionEntry() (RateLimiterEviction, error) {
+	var err error
+	var evictions RateLimiterEviction
+	if !r.checkRequiredVariables() {
+		return evictions, err
+	}
+	if !isExistPath(r.evictionFilePath) {
+		if f, err := os.Create(r.evictionFilePath); err != nil {
+			defer f.Close()
+			os.Stderr.WriteString(fmt.Sprintf("Failed create eviction file, path: %v, err: %v\n", r.evictionFilePath, err))
+		} else {
+			os.Stdout.WriteString(fmt.Sprintf("Created eviction file, path: %v\n", r.evictionFilePath))
+			return evictions, err
+		}
+	}
+	r.mutex.RLock()
+	defer r.mutex.RUnlock()
+	f, err := os.Open(r.evictionFilePath)
+	if err != nil {
+		return evictions, fmt.Errorf("Failed open eviction file, path: %v, err: %v\n", r.evictionFilePath, err)
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil {
+		return evictions, fmt.Errorf("Failed stat eviction file, path: %v, err: %v\n", r.evictionFilePath, err)
+	} else {
+		if fi.Size() == 0 {
+			return evictions, nil
+		}
+	}
+	var file RateLimiterEviction
+	dec := gob.NewDecoder(f)
+	err = dec.Decode(&file)
+	if err != nil {
+		return evictions, fmt.Errorf("Failed decode eviction file, path: %v, err: %v\n", r.evictionFilePath, err)
+	}
+	return file, nil
+}
+
+func (r *RateLimiter) writeEvictionEntry() error {
+	if !r.checkRequiredVariables() {
+		return nil
+	}
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	f, err := os.Create(r.evictionFilePath)
+	if err != nil {
+		return fmt.Errorf("Failed create eviction file, path: %v, err: %v\n", r.evictionFilePath, err)
+	}
+	defer f.Close()
+	header := RateLimiterEvictionHeader{
+		LimitCount:      r.limitCount,
+		Interval:        r.interval,
+		LastCleanedTime: r.lastCleanedTime,
+		StopTime:        time.Now(),
+	}
+	file := RateLimiterEviction{
+		Header: header,
+		Entry:  r.entry,
+	}
+	enc := gob.NewEncoder(f)
+	if err := enc.Encode(file); err != nil {
+		return fmt.Errorf(fmt.Sprintf("Failed write eviction file, path: %v, err: %v\n", r.evictionFilePath, err))
+	}
+	return nil
+}
+
+func (r *RateLimiter) incrementCount(key string) int {
+	v, ok := r.getCount(key)
 	nv := v + 1
 	if !ok {
-		r.set(key, 1)
+		r.setCount(key, 1)
 	} else {
-		r.set(key, nv)
+		r.setCount(key, nv)
 	}
 	return nv
 }
 
 func (r *RateLimiter) isRateLimited(key string) bool {
-	v, ok := r.get(key)
+	v, ok := r.getCount(key)
 	if !ok {
-		r.set(key, 1)
+		r.setCount(key, 1)
 	} else {
 		if v < r.limitCount {
 			return false
@@ -1187,56 +1595,129 @@ func (r *RateLimiter) isRateLimited(key string) bool {
 	return false
 }
 
-func (r *RateLimiter) runClearRateLimitWorker() {
+func (r *RateLimiter) runLimitCleaner() {
+	if r.evictionFilePath != "" {
+		ev, err := r.readEvictionEntry()
+		if err != nil {
+			r.runLimitCleanWorker()
+			os.Stderr.WriteString(fmt.Sprintf("Failed read eviction file, path: %v, err: %v\n", r.evictionFilePath, err))
+			return
+		}
+		if r.applyEvictionEntry(ev) {
+			elapsedTime := ev.Header.StopTime.Sub(ev.Header.LastCleanedTime)
+			time.AfterFunc(time.Duration(ev.Header.Interval)*time.Second-elapsedTime, r.runLimitCleanWorker)
+		}
+	} else {
+		r.runLimitCleanWorker()
+	}
+}
+
+func (r *RateLimiter) runLimitCleanWorker() {
 	go func() {
 		ticker := time.NewTicker(time.Duration(r.interval) * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				r.flushall()
+				r.flushallEntry()
+				r.lastCleanedTime = time.Now()
 			case <-r.done:
-				r.flushall()
+				r.flushallEntry()
 				return
 			case <-r.ctx.Done():
-				r.stopClearRateLimitWorker()
+				r.stoplimitCleanWorker()
 			}
 		}
 	}()
 }
 
-func (r *RateLimiter) stopClearRateLimitWorker() {
+func (r *RateLimiter) stoplimitCleanWorker() {
 	r.once.Do(func() {
+		if err := r.writeEvictionEntry(); err != nil {
+			os.Stderr.WriteString(fmt.Sprintf("Failed write evication entry, err: %v\n", err))
+		}
 		close(r.done)
 	})
 }
 
-// functions
-func setOptions() {
-	flag.CommandLine.Init("fs", flag.ExitOnError)
-	flagSet = flag.NewFlagSet("fs", flag.ExitOnError)
-	flagSet.StringVar(&options.serverHost, "h", "127.0.0.1", "file server hostname")
-	flagSet.StringVar(&options.serverPort, "p", "8080", "file server port")
-	flagSet.StringVar(&options.locationName, "l", "Asia/Tokyo", "time loation")
-	flagSet.BoolVar(&options.cd, "c", false, "approve change base directory, not recommended")
-	flagSet.BoolVar(&options.simple, "s", false, "render simple, only file names")
-	flagSet.BoolVar(&options.version, "v", false, "show version")
-	flagSet.BoolVar(&options.debug, "d", false, "log level for debug")
-	flagSet.BoolVar(&options.open, "o", false, "browser open on file server address")
+func newOptions() *CommandOption {
+	return &CommandOption{}
 }
 
-func newConfig() (*Config, error) {
-	var config *Config
+func (c *CommandOption) setFlags() {
+	flag.CommandLine.Init("fs", flag.ExitOnError)
+	flagSet = flag.NewFlagSet("fs", flag.ExitOnError)
+	flagSet.StringVar(&c.serverHost, "h", "127.0.0.1", "file server hostname")
+	flagSet.StringVar(&c.serverPort, "p", "8080", "file server port")
+	flagSet.BoolVar(&c.cd, "c", false, "approve change base directory")
+	flagSet.BoolVar(&c.open, "o", false, "browser open on file server address")
+	flagSet.BoolVar(&c.simple, "s", false, "render simple, only file names")
+	flagSet.BoolVar(&c.debug, "d", false, "log level for debug")
+}
+
+func (c *CommandOption) overrideWithEnvironments() error {
+	var err error
+	fsServerPort := os.Getenv("FS_SERVER_PORT")
+	if fsServerPort != "" {
+		if _, err := strconv.Atoi(fsServerPort); err != nil {
+			c.serverPort = fsServerPort
+		}
+		return fmt.Errorf("Failed to parse FS_SERVER_PORT to number, err: %v\n", err)
+	}
+	fsServerHost := os.Getenv("FS_SERVER_HOST")
+	if fsServerHost != "" {
+		c.serverHost = fsServerHost
+	}
+	fsSimpleMode := os.Getenv("FS_SIMPLE_MODE")
+	if fsSimpleMode != "" {
+		is, err := strconv.ParseBool(fsSimpleMode)
+		if err != nil {
+			return fmt.Errorf("Failed to parse FS_SIMPLE_MODE to bool, err: %v\n", err)
+		}
+		c.simple = is
+	}
+	fsDebugMode := os.Getenv("FS_DEBUG_MODE")
+	if fsDebugMode != "" {
+		is, err := strconv.ParseBool(fsDebugMode)
+		if err != nil {
+			return fmt.Errorf("Failed to parse FS_DEBUG_MODE to bool, err: %v\n", err)
+		}
+		c.debug = is
+	}
+	fsOpenMode := os.Getenv("FS_OPEN_MODE")
+	if fsOpenMode != "" {
+		is, err := strconv.ParseBool(fsOpenMode)
+		if err != nil {
+			return fmt.Errorf("Failed to parse FS_OPEN_MODE to bool, err: %v\n", err)
+		}
+		c.open = is
+	}
+	fsCd := os.Getenv("FS_CHANGE_DIRECTORY")
+	if fsCd != "" {
+		is, err := strconv.ParseBool(fsCd)
+		if err != nil {
+			return fmt.Errorf("Failed to parse FS_CHANGE_DIRECTORY to bool, err: %v\n", err)
+		}
+		c.open = is
+	}
+	return err
+}
+
+func newConfig(options CommandOption) (*Config, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		home = os.Getenv("HOME")
 		if home == "" {
-			return config, fmt.Errorf("User HOME directory is not found, Please set $HOME environment variable")
+			return &Config{}, fmt.Errorf("User HOME directory is not found, Please set $HOME environment variable\n")
 		}
 	}
 	fsTimeFormat := os.Getenv("FS_TIME_FORMAT")
 	if fsTimeFormat == "" {
 		fsTimeFormat = "06/01/02 15:04:05"
+	}
+	fsCorsOrigins := os.Getenv("FS_CORS_ORIGINS")
+	if fsCorsOrigins == "" {
+		fsCorsOrigins = "*"
 	}
 	fsFrecencyFilePath := os.Getenv("FS_FRECENCY_FILE_PATH")
 	if fsFrecencyFilePath == "" {
@@ -1256,17 +1737,34 @@ func newConfig() (*Config, error) {
 	} else {
 		fsRateLimitCount = v
 	}
-	config = &Config{
-		HOME:                   home,
-		OPEN_CMD:               os.Getenv("OPEN_CMD"),
-		FS_ADMIN_IP:            os.Getenv("FS_ADMIN_IP"),
-		FS_AUTH_PATH:           os.Getenv("FS_AUTH_PATH"),
-		FS_AUTH_USER:           os.Getenv("FS_AUTH_USER"),
-		FS_AUTH_PASSWORD:       os.Getenv("FS_AUTH_PASSWORD"),
-		FS_FRECENCY_FILE_PATH:  fsFrecencyFilePath,
-		FS_TIME_FORMAT:         fsTimeFormat,
-		FS_RATE_LIMIT_INTERVAL: fsRateLimitInterval,
-		FS_RATE_LIMIT_COUNT:    fsRateLimitCount,
+	var fsAccessLogEvictionInterval int
+	fsAccessLogEvictionIntervalStr := os.Getenv("FS_ACCESS_LOG_EVICTION_INTERVAL")
+	if v, err := strconv.Atoi(fsAccessLogEvictionIntervalStr); err != nil || fsAccessLogEvictionIntervalStr == "" {
+		fsAccessLogEvictionInterval = 300
+	} else {
+		fsAccessLogEvictionInterval = v
+	}
+	config := &Config{
+		HOME:                             home,
+		FS_SERVER_PORT:                   options.serverPort,
+		FS_SERVER_HOST:                   options.serverHost,
+		FS_DEBUG_MODE:                    options.debug,
+		FS_SIMPLE_MODE:                   options.simple,
+		FS_CHANGE_DIRECTORY:              options.cd,
+		FS_OPEN_MODE:                     options.open,
+		FS_OPEN_CMD:                      os.Getenv("FS_OPEN_CMD"),
+		FS_ADMIN_IP:                      os.Getenv("FS_ADMIN_IP"),
+		FS_AUTH_PATH:                     os.Getenv("FS_AUTH_PATH"),
+		FS_AUTH_USER:                     os.Getenv("FS_AUTH_USER"),
+		FS_AUTH_PASSWORD:                 os.Getenv("FS_AUTH_PASSWORD"),
+		FS_ACCESS_LOG_DIRECTORY:          os.Getenv("FS_ACCESS_LOG_DIRECTORY"),
+		FS_RATE_LIMIT_EVICTION_FILE_PATH: os.Getenv("FS_RATE_LIMIT_EVICTION_FILE_PATH"),
+		FS_ACCESS_LOG_EVICTION_INTERVAL:  fsAccessLogEvictionInterval,
+		FS_CORS_ORIGINS:                  fsCorsOrigins,
+		FS_FRECENCY_FILE_PATH:            fsFrecencyFilePath,
+		FS_TIME_FORMAT:                   fsTimeFormat,
+		FS_RATE_LIMIT_INTERVAL:           fsRateLimitInterval,
+		FS_RATE_LIMIT_COUNT:              fsRateLimitCount,
 	}
 	return config, err
 }
@@ -1300,6 +1798,18 @@ func fileSize(s int64) string {
 	return fmt.Sprintf("%.1f%c", float64(n), "KMGT"[exp])
 }
 
+func getFileLineCount(file *os.File) (int, error) {
+	scanner := bufio.NewScanner(file)
+	lineCount := 0
+	for scanner.Scan() {
+		lineCount++
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	return lineCount, nil
+}
+
 func splitPath(path string) []string {
 	if path[0] == '/' {
 		path = path[1:]
@@ -1329,7 +1839,7 @@ func splitPath(path string) []string {
 	return s
 }
 
-func getHttpRequestIpAddress(r *http.Request) (net.IP, error) {
+func getReqIpAddress(r *http.Request) (net.IP, error) {
 	var err error
 	remoteAddr := strings.TrimSpace(r.Header.Get("X-Real-IP"))
 	if remoteAddr == "" {
@@ -1365,32 +1875,27 @@ func getLocalIps() ([]net.IP, error) {
 	return ips, err
 }
 
-// endpoints
-func init() {
-	// set options
-	setOptions()
-}
-
 func main() {
+	// setOptions
+	options := newOptions()
+	options.setFlags()
+	if err := options.overrideWithEnvironments(); err != nil {
+		log.Fatalf("Failed override command options with environments, err: %v", err)
+	}
+
 	// parse flags
 	flagSet.Parse(os.Args[1:])
 	args := flagSet.Args()
 
 	// set config
-	config, err := newConfig()
+	config, err := newConfig(*options)
 	if err != nil {
-		log.Fatalf("Failed set config %v", err)
+		log.Fatalf("Failed set config, err: %v", err)
 	}
 
 	// set log level
 	if options.debug {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
-	}
-
-	// when version
-	if options.version {
-		showVersion()
-		os.Exit(0)
 	}
 
 	// set directory
@@ -1408,12 +1913,12 @@ func main() {
 	// server
 	server, err := newServer(dir, config)
 	if err != nil {
-		log.Fatalf("Failed initialize server %v", err)
+		log.Fatalf("Failed initialize server, err: %v", err)
 	}
 
 	if err = server.serve(); err != nil || err != http.ErrServerClosed {
 		log.Printf("Server closed gracefully")
 	} else {
-		log.Fatalf("Failed at serve %v", err)
+		log.Fatalf("Failed at serve, err: %v", err)
 	}
 }
