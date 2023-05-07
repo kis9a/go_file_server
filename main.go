@@ -312,9 +312,10 @@ func (s *Server) middlewareUrlParser(h http.Handler) http.Handler {
 			http.Error(w, fmt.Sprintf("Failed to path unescape request path %v", err), http.StatusInternalServerError)
 			return
 		}
+		pathBefore := s.path
 		s.path = path.Join(s.directory, s.urlPath)
 		s.query = r.URL.Query()
-		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), "pathBefore", s.path)))
+		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), "pathBefore", pathBefore)))
 	})
 }
 
